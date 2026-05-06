@@ -342,8 +342,273 @@ const fetchOpenFoodFactsCandidate = async (productName: string) => {
   }
 };
 
+type ProductImageCandidate = {
+  name?: string;
+  brand?: string;
+  weight?: string;
+  imageUrl: string;
+  imageSource: string;
+  imageSourceUrl?: string;
+  merchantCategories?: string[];
+  imageConfidence: number;
+};
+
+type ProductImageVisionReview = {
+  accepted: boolean;
+  confidence: number;
+  reason?: string;
+};
+
+const asStringValue = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+
+const asBooleanValue = (value: unknown) => value === true || (typeof value === "string" && value.toLowerCase() === "true");
+
+const normalizeSearchTerm = (value: string) =>
+  value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const productImageSearchQueries = (input: { rawName: string; product: Record<string, unknown> }) => {
+  const rawName = asStringValue(input.rawName);
+  const name = asStringValue(input.product.name) || rawName;
+  const brand = asStringValue(input.product.brand);
+  const weight = asStringValue(input.product.weight);
+  const base = [brand, name, weight].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const queries = [
+    `${base} prodotto confezione sfondo bianco`,
+    `${base} immagine prodotto`,
+    `${rawName} prodotto supermercato`,
+  ]
+    .map((query) => query.replace(/\b(sconto|fidaty|fidati|punti|totale|iva|pos)\b/gi, "").replace(/\s+/g, " ").trim())
+    .filter((query) => query.length >= 4);
+  return Array.from(new Set(queries)).slice(0, 2);
+};
+
+const trustedProductImageSourcePattern =
+  /(esselunga|coop|conad|carrefour|pam|selex|despar|iper|crai|bennet|tigros|supermercato|supermercati|spesaonline|openfoodfacts|amazon|everli|cortilia|alce nero|barilla|mulino bianco|lavazza|granoro|rummo|granolo|granarolo|muller|dash|dixan|rio mare|mutti|findus|cameo|galbani|parmalat|nescafe|san benedetto|sant'anna|valfrutta|bauli|ferrero)/i;
+
+const cleanPackshotPattern = /(packshot|confezione|prodotto|product|white|bianco|png|frontale|front)/i;
+const noisyImagePattern = /(recipe|ricetta|scaffale|shelf|volantino|catalogo|banner|promo|offerta|blog|news|article|ingredienti|ingredients)/i;
+
+const scoreProductImageCandidate = (item: Record<string, unknown>, productName: string) => {
+  const haystack = normalizeSearchTerm(
+    [
+      item.title,
+      item.source,
+      item.sourceUrl,
+      item.pageUrl,
+      item.origin,
+      item.contextUrl,
+      item.displayedUrl,
+      item.snippet,
+      item.imageUrl,
+      item.link,
+      item.raw_link,
+    ]
+      .map(asStringValue)
+      .filter(Boolean)
+      .join(" "),
+  );
+  const tokens = normalizeSearchTerm(productName)
+    .split(" ")
+    .filter((token) => token.length >= 3 && !["prod", "prodotto", "conf", "confezione", "supermercato"].includes(token));
+  const matches = tokens.filter((token) => haystack.includes(token)).length;
+  const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
+  const cleanPackshot = cleanPackshotPattern.test(haystack);
+  const noisyImage = noisyImagePattern.test(haystack);
+  return matches * 8 + (trustedDomain ? 14 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+};
+
+const fetchSerpApiGoogleImageCandidates = async (input: {
+  rawName: string;
+  product: Record<string, unknown>;
+}): Promise<ProductImageCandidate[]> => {
+  const apiKey = Deno.env.get("SERPAPI_API_KEY");
+  if (!apiKey) return [];
+
+  const query = productImageSearchQueries(input)[0];
+  if (!query) return [];
+
+  const url = new URL("https://serpapi.com/search.json");
+  url.searchParams.set("engine", "google_images_light");
+  url.searchParams.set("q", query);
+  url.searchParams.set("google_domain", "google.it");
+  url.searchParams.set("gl", "it");
+  url.searchParams.set("hl", "it");
+  url.searchParams.set("safe", "active");
+  url.searchParams.set("filter", "1");
+  url.searchParams.set("api_key", apiKey);
+
+  try {
+    const response = await fetch(url.toString(), {
+      headers: { Accept: "application/json", "User-Agent": "FinanceCompass/1.0 product-image-search" },
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!response.ok) return [];
+
+    const payload = await response.json() as { images_results?: unknown[] };
+    const rows = Array.isArray(payload.images_results) ? payload.images_results : [];
+    const productName = asStringValue(input.product.name) || input.rawName;
+    const seen = new Set<string>();
+
+    return rows
+      .map((row) => asRecord(row))
+      .map((row) => {
+        const original = asStringValue(row.original);
+        if (!/^https?:\/\//i.test(original) || seen.has(original) || Boolean(row.unsafe)) return null;
+        seen.add(original);
+        const score = scoreProductImageCandidate(row, productName) + (row.is_product === true ? 16 : 0);
+        return {
+          candidate: {
+            name: productName,
+            brand: asStringValue(input.product.brand) || undefined,
+            weight: asStringValue(input.product.weight) || undefined,
+            imageUrl: original,
+            imageSource: "serpapi_google_images_light",
+            imageSourceUrl: asStringValue(row.link) || asStringValue(row.raw_link) || original,
+            merchantCategories: ["Google Images Light", "SerpApi", asStringValue(row.source)].filter(Boolean),
+            imageConfidence: Math.min(0.9, 0.6 + Math.max(0, Math.min(score, 30)) / 100),
+          } satisfies ProductImageCandidate,
+          score,
+        };
+      })
+      .filter((entry): entry is { candidate: ProductImageCandidate; score: number } => Boolean(entry))
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.candidate)
+      .slice(0, 8);
+  } catch {
+    return [];
+  }
+};
+
+const extractApifyImageUrl = (item: Record<string, unknown>) => {
+  const candidates = [
+    item.imageUrl,
+    item.originalUrl,
+    item.originalImageUrl,
+    item.fullImageUrl,
+    item.contentUrl,
+    item.url,
+    item.image,
+    item.thumbnailUrl,
+  ];
+  for (const candidate of candidates) {
+    const value = asStringValue(candidate);
+    if (/^https?:\/\//i.test(value)) return value;
+  }
+  return "";
+};
+
+const extractApifySourceUrl = (item: Record<string, unknown>) => {
+  const candidates = [item.sourceUrl, item.pageUrl, item.origin, item.contextUrl, item.link, item.hostPageUrl];
+  for (const candidate of candidates) {
+    const value = asStringValue(candidate);
+    if (/^https?:\/\//i.test(value)) return value;
+  }
+  return undefined;
+};
+
+const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: string) => {
+  const haystack = normalizeSearchTerm(
+    [
+      item.title,
+      item.source,
+      item.sourceUrl,
+      item.pageUrl,
+      item.origin,
+      item.contextUrl,
+      item.displayedUrl,
+      item.snippet,
+      item.imageUrl,
+    ]
+      .map(asStringValue)
+      .filter(Boolean)
+      .join(" "),
+  );
+  const tokens = normalizeSearchTerm(productName)
+    .split(" ")
+    .filter((token) => token.length >= 3 && !["prod", "prodotto", "conf", "gr"].includes(token));
+  const matches = tokens.filter((token) => haystack.includes(token)).length;
+  const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
+  const cleanPackshot = cleanPackshotPattern.test(haystack);
+  const noisyImage = noisyImagePattern.test(haystack);
+  return matches * 8 + (trustedDomain ? 12 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+};
+
+const fetchApifyGoogleImageCandidates = async (input: {
+  rawName: string;
+  product: Record<string, unknown>;
+}): Promise<ProductImageCandidate[]> => {
+  const token = Deno.env.get("APIFY_API_TOKEN");
+  if (!token) return [];
+
+  const queries = productImageSearchQueries(input);
+  if (!queries.length) return [];
+
+  const actorId = Deno.env.get("APIFY_GOOGLE_IMAGES_ACTOR_ID") || "tnudF2IxzORPhg4r8";
+  const url = new URL(`https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items`);
+  url.searchParams.set("timeout", "90");
+  url.searchParams.set("clean", "true");
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        queries,
+        maxResultsPerQuery: 8,
+      }),
+      signal: AbortSignal.timeout(100000),
+    });
+    if (!response.ok) return [];
+
+    const payload = await response.json();
+    const rows = Array.isArray(payload) ? payload : flattenModelsPayload(payload);
+    const productName = asStringValue(input.product.name) || input.rawName;
+    const seen = new Set<string>();
+
+    return rows
+      .map((row) => asRecord(row))
+      .map((row) => {
+        const imageUrl = extractApifyImageUrl(row);
+        if (!imageUrl || seen.has(imageUrl)) return null;
+        seen.add(imageUrl);
+        const score = scoreApifyImageCandidate(row, productName);
+        return {
+          candidate: {
+            name: productName,
+            brand: asStringValue(input.product.brand) || undefined,
+            weight: asStringValue(input.product.weight) || undefined,
+            imageUrl,
+            imageSource: "apify_google_images",
+            imageSourceUrl: extractApifySourceUrl(row) || imageUrl,
+            merchantCategories: ["Google Images", "Apify"],
+            imageConfidence: Math.min(0.86, 0.58 + Math.max(0, Math.min(score, 28)) / 100),
+          } satisfies ProductImageCandidate,
+          score,
+        };
+      })
+      .filter((entry): entry is { candidate: ProductImageCandidate; score: number } => Boolean(entry))
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.candidate)
+      .slice(0, 6);
+  } catch {
+    return [];
+  }
+};
+
 const PRODUCT_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const PRODUCT_IMAGE_BUCKET = "product-images";
+const PRODUCT_IMAGE_VISION_REVIEW_LIMIT = 3;
 
 const normalizeStorageSegment = (value: string) =>
   value
@@ -422,6 +687,63 @@ const mirrorProductImageToStorage = async (input: {
     };
   } catch {
     return null;
+  }
+};
+
+const removeProductImageFromStorage = async (storagePath: string) => {
+  try {
+    await getSupabase().storage.from(PRODUCT_IMAGE_BUCKET).remove([storagePath]);
+  } catch {
+    // Best effort cleanup: a rejected image must not block product enrichment.
+  }
+};
+
+const reviewProductImageWithVision = async (input: {
+  productName: string;
+  product: Record<string, unknown>;
+  imageUrl: string;
+  model: string;
+}): Promise<ProductImageVisionReview> => {
+  try {
+    const content = await completionV1(
+      `Verifica se l'immagine mostra davvero il prodotto cercato.
+
+Prodotto cercato: ${input.productName}
+Nome normalizzato: ${asStringValue(input.product.name) || "non disponibile"}
+Marca: ${asStringValue(input.product.brand) || "non disponibile"}
+Formato/peso: ${asStringValue(input.product.weight) || "non disponibile"}
+
+Rispondi SOLO con JSON:
+{
+  "match": boolean,
+  "confidence": numero da 0 a 1,
+  "visualProductName": string,
+  "reason": string,
+  "rejectReason": "different_product | generic_photo | logo_only | shelf_or_recipe | unreadable | unknown"
+}
+
+Regole:
+- Accetta solo se l'immagine mostra la confezione/prodotto coerente con nome e marca.
+- Prediligi immagini pulite tipo packshot: prodotto singolo, frontale, ben illuminato, sfondo bianco o neutro.
+- Per frutta/verdura o prodotti sfusi generici puoi accettare una foto generica del prodotto se non esiste marca specifica.
+- Rifiuta foto di ricette, scaffali, loghi, banner promozionali, ingredienti generici quando il prodotto cercato ha una marca, o prodotti simili ma di marca/gusto/formato diverso.
+- A parita di corrispondenza, abbassa molto la confidence per immagini ambientate, promozionali, con sfondo caotico o con piu prodotti non chiaramente pertinenti.
+- Se non sei sicuro, match=false.`,
+      { model: input.model, images: [input.imageUrl] },
+    );
+    const review = extractJson<Record<string, unknown>>(content, {});
+    const confidence = Math.max(0, Math.min(1, asOptionalNumber(review.confidence) ?? 0));
+    return {
+      accepted: asBooleanValue(review.match) && confidence >= 0.62,
+      confidence,
+      reason: asStringValue(review.reason) || asStringValue(review.rejectReason) || undefined,
+    };
+  } catch {
+    return {
+      accepted: false,
+      confidence: 0,
+      reason: "vision_review_failed",
+    };
   }
 };
 
@@ -512,7 +834,6 @@ Deno.serve(async (request) => {
       const currentCategory = args?.currentCategory ? String(args.currentCategory) : undefined;
       const allowImageSearch = Boolean(args?.allowImageSearch);
       const productId = args?.productId ? String(args.productId) : undefined;
-      const imageCandidate = allowImageSearch ? await fetchOpenFoodFactsCandidate(productName) : null;
       const content = await completionV0(
         `Sei un esperto di prodotti del mercato italiano. Arricchisci una voce prodotto per un catalogo globale.
 
@@ -552,13 +873,53 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         enrichmentSource: "straico",
       }) as Record<string, unknown>;
 
-      const mirroredImage = allowImageSearch && imageCandidate?.imageUrl
-        ? await mirrorProductImageToStorage({
-            sourceUrl: imageCandidate.imageUrl,
-            productName: imageCandidate.name || productName,
-            productId,
-          })
-        : null;
+      let imageCandidate: ProductImageCandidate | null = null;
+      let mirroredImage: Awaited<ReturnType<typeof mirrorProductImageToStorage>> | null = null;
+      let imageVisionReview: ProductImageVisionReview | null = null;
+      if (allowImageSearch) {
+        const candidateProviders: Array<() => Promise<ProductImageCandidate[]>> = [
+          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product }),
+          () => fetchApifyGoogleImageCandidates({ rawName: productName, product }),
+          async () => {
+            const candidate = await fetchOpenFoodFactsCandidate(productName);
+            return candidate?.imageUrl ? [candidate] : [];
+          },
+        ];
+
+        let visionReviews = 0;
+        for (const getCandidates of candidateProviders) {
+          if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
+          const candidates = await getCandidates();
+          for (const candidate of candidates) {
+            if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
+            const mirrored = await mirrorProductImageToStorage({
+              sourceUrl: candidate.imageUrl,
+              productName: candidate.name || asStringValue(product.name) || productName,
+              productId,
+            });
+            if (!mirrored?.publicUrl) continue;
+
+            visionReviews += 1;
+            const review = await reviewProductImageWithVision({
+              productName,
+              product,
+              imageUrl: mirrored.publicUrl,
+              model: models.documentAnalysis,
+            });
+
+            if (review.accepted) {
+              imageCandidate = candidate;
+              mirroredImage = mirrored;
+              imageVisionReview = review;
+              break;
+            }
+            await removeProductImageFromStorage(mirrored.storagePath);
+          }
+          if (mirroredImage?.publicUrl) {
+            break;
+          }
+        }
+      }
 
       if (allowImageSearch && imageCandidate?.imageUrl && mirroredImage?.publicUrl) {
         product.name = product.name || imageCandidate.name || productName;
@@ -566,10 +927,12 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.weight = product.weight || imageCandidate.weight;
         product.imageUrl = mirroredImage.publicUrl;
         product.imageSource = `${imageCandidate.imageSource}->${PRODUCT_IMAGE_BUCKET}`;
-        product.imageSourceUrl = imageCandidate.imageUrl;
+        product.imageSourceUrl = imageCandidate.imageSourceUrl || imageCandidate.imageUrl;
         product.imageStoragePath = mirroredImage.storagePath;
         product.imageConfidence = imageCandidate.imageConfidence;
-        product.enrichmentSource = "straico+openfoodfacts+storage";
+        product.imageVisionConfidence = imageVisionReview?.confidence ?? null;
+        product.imageVisionReason = imageVisionReview?.reason || null;
+        product.enrichmentSource = `straico+${imageCandidate.imageSource}+storage`;
         product.merchantCategories = Array.from(
           new Set([
             ...((Array.isArray(product.merchantCategories) ? product.merchantCategories : []) as string[]),
@@ -581,6 +944,8 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.imageSource = null;
         product.imageSourceUrl = null;
         product.imageStoragePath = null;
+        product.imageVisionConfidence = null;
+        product.imageVisionReason = null;
       }
 
       return json({

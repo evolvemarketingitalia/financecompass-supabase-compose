@@ -317,6 +317,9 @@ services:
       SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
       SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
       STRAICO_API_KEY: ${STRAICO_API_KEY}
+      SERPAPI_API_KEY: ${SERPAPI_API_KEY}
+      APIFY_API_TOKEN: ${APIFY_API_TOKEN}
+      APIFY_GOOGLE_IMAGES_ACTOR_ID: ${APIFY_GOOGLE_IMAGES_ACTOR_ID}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command: [ "start", "--main-service", "/home/deno/functions/main" ]
