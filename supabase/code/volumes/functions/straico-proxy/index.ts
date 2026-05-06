@@ -802,6 +802,11 @@ Deno.serve(async (request) => {
     if (action === "health") {
       return json({
         straicoConfigured: Boolean(Deno.env.get("STRAICO_API_KEY")),
+        productImageSearch: {
+          serpApiConfigured: Boolean(Deno.env.get("SERPAPI_API_KEY")),
+          apifyConfigured: Boolean(Deno.env.get("APIFY_API_TOKEN")),
+          apifyActorConfigured: Boolean(Deno.env.get("APIFY_GOOGLE_IMAGES_ACTOR_ID")),
+        },
         models,
       });
     }
@@ -876,6 +881,10 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
       let imageCandidate: ProductImageCandidate | null = null;
       let mirroredImage: Awaited<ReturnType<typeof mirrorProductImageToStorage>> | null = null;
       let imageVisionReview: ProductImageVisionReview | null = null;
+      let imageSearchStatus = allowImageSearch ? "no_candidates" : "disabled";
+      let imageSearchCandidatesFound = 0;
+      let imageSearchCandidatesReviewed = 0;
+      let imageSearchLastRejectReason: string | null = null;
       if (allowImageSearch) {
         const candidateProviders: Array<() => Promise<ProductImageCandidate[]>> = [
           () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product }),
@@ -890,6 +899,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         for (const getCandidates of candidateProviders) {
           if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
           const candidates = await getCandidates();
+          imageSearchCandidatesFound += candidates.length;
           for (const candidate of candidates) {
             if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
             const mirrored = await mirrorProductImageToStorage({
@@ -897,9 +907,13 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               productName: candidate.name || asStringValue(product.name) || productName,
               productId,
             });
-            if (!mirrored?.publicUrl) continue;
+            if (!mirrored?.publicUrl) {
+              imageSearchStatus = "candidate_download_failed";
+              continue;
+            }
 
             visionReviews += 1;
+            imageSearchCandidatesReviewed = visionReviews;
             const review = await reviewProductImageWithVision({
               productName,
               product,
@@ -911,8 +925,11 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               imageCandidate = candidate;
               mirroredImage = mirrored;
               imageVisionReview = review;
+              imageSearchStatus = "accepted";
               break;
             }
+            imageSearchStatus = "vision_rejected";
+            imageSearchLastRejectReason = review.reason || null;
             await removeProductImageFromStorage(mirrored.storagePath);
           }
           if (mirroredImage?.publicUrl) {
@@ -932,6 +949,9 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.imageConfidence = imageCandidate.imageConfidence;
         product.imageVisionConfidence = imageVisionReview?.confidence ?? null;
         product.imageVisionReason = imageVisionReview?.reason || null;
+        product.imageSearchStatus = imageSearchStatus;
+        product.imageSearchCandidatesFound = imageSearchCandidatesFound;
+        product.imageSearchCandidatesReviewed = imageSearchCandidatesReviewed;
         product.enrichmentSource = `straico+${imageCandidate.imageSource}+storage`;
         product.merchantCategories = Array.from(
           new Set([
@@ -946,6 +966,10 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.imageStoragePath = null;
         product.imageVisionConfidence = null;
         product.imageVisionReason = null;
+        product.imageSearchStatus = imageSearchStatus;
+        product.imageSearchCandidatesFound = imageSearchCandidatesFound;
+        product.imageSearchCandidatesReviewed = imageSearchCandidatesReviewed;
+        product.imageSearchLastRejectReason = imageSearchLastRejectReason;
       }
 
       return json({
