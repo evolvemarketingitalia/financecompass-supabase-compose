@@ -252,26 +252,27 @@ const flattenModelsPayload = (payload: unknown): unknown[] => {
 };
 
 const fetchStraicoModels = async () => {
-  const response = await fetch(`${STRAICO_BASE_URL}/v2/models`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${requireEnv("STRAICO_API_KEY")}`,
-      Accept: "application/json",
-    },
-  });
+  try {
+    const response = await fetch(`${STRAICO_BASE_URL}/v2/models`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${requireEnv("STRAICO_API_KEY")}`,
+        Accept: "application/json",
+      },
+    });
 
-  if (!response.ok) {
-    const payload = await response.text().catch(() => "");
-    throw new Error(payload || `Straico models error ${response.status}`);
+    if (!response.ok) return FALLBACK_MODEL_OPTIONS;
+
+    const payload = await response.json();
+    const models = flattenModelsPayload(payload)
+      .map(normalizeModelOption)
+      .filter((model): model is StraicoModelOption => Boolean(model))
+      .sort((a, b) => `${a.provider || ""} ${a.name}`.localeCompare(`${b.provider || ""} ${b.name}`));
+
+    return models.length ? models : FALLBACK_MODEL_OPTIONS;
+  } catch {
+    return FALLBACK_MODEL_OPTIONS;
   }
-
-  const payload = await response.json();
-  const models = flattenModelsPayload(payload)
-    .map(normalizeModelOption)
-    .filter((model): model is StraicoModelOption => Boolean(model))
-    .sort((a, b) => `${a.provider || ""} ${a.name}`.localeCompare(`${b.provider || ""} ${b.name}`));
-
-  return models.length ? models : FALLBACK_MODEL_OPTIONS;
 };
 
 const completionV0 = async (message: string, options: { model?: string; smart?: "quality" | "balance" | "budget" }) => {
