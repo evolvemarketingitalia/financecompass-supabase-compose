@@ -1151,6 +1151,12 @@ const PRODUCT_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const PRODUCT_IMAGE_BUCKET = "product-images";
 const PRODUCT_IMAGE_VISION_REVIEW_LIMIT = 3;
 
+const publicStorageUrl = (bucket: string, path: string) =>
+  `${getPublicSupabaseUrl()}/storage/v1/object/public/${bucket}/${path
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+
 const normalizeStorageSegment = (value: string) =>
   value
     .toLowerCase()
@@ -1217,11 +1223,10 @@ const mirrorProductImageToStorage = async (input: {
     });
     if (error) return null;
 
-    const { data } = supabase.storage.from(PRODUCT_IMAGE_BUCKET).getPublicUrl(path);
-    if (!data.publicUrl) return null;
+    const publicUrl = publicStorageUrl(PRODUCT_IMAGE_BUCKET, path);
 
     return {
-      publicUrl: data.publicUrl,
+      publicUrl,
       storagePath: path,
       contentType,
       size: bytes.byteLength,
@@ -1264,8 +1269,10 @@ Rispondi SOLO con JSON:
 }
 
 Regole:
-- Accetta solo se l'immagine mostra la confezione/prodotto coerente con nome e marca.
+- Accetta se l'immagine mostra in modo plausibile la confezione/prodotto coerente con nome, marca o linea prodotto.
 - Prediligi immagini pulite tipo packshot: prodotto singolo, frontale, ben illuminato, sfondo bianco o neutro.
+- Non rigettare solo per differenze minori di formato, numero pezzi, lingua del packaging o restyling grafico, se marca e linea prodotto sono corrette.
+- Per prodotti GDO con nome descrittivo incompleto, accetta una immagine della stessa linea/gusto quando la fonte candidato e coerente.
 - Per frutta/verdura o prodotti sfusi generici puoi accettare una foto generica del prodotto se non esiste marca specifica.
 - Rifiuta foto di ricette, scaffali, loghi, banner promozionali, ingredienti generici quando il prodotto cercato ha una marca, o prodotti simili ma di marca/gusto/formato diverso.
 - A parita di corrispondenza, abbassa molto la confidence per immagini ambientate, promozionali, con sfondo caotico o con piu prodotti non chiaramente pertinenti.
@@ -1283,7 +1290,7 @@ Regole:
     return {
       accepted: false,
       confidence: 0,
-      reason: "vision_review_failed",
+      reason: "vision_fetch_failed_or_model_error",
     };
   }
 };
@@ -1592,7 +1599,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
             const review = await reviewProductImageWithVision({
               productName,
               product,
-              imageUrl: mirrored.publicUrl,
+              imageUrl: candidate.imageUrl,
               model: models.documentAnalysis,
             });
             await logger({
@@ -1603,8 +1610,9 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               request: {
                 model: models.documentAnalysis,
                 productName,
-                candidateImageUrl: mirrored.publicUrl,
+                candidateImageUrl: candidate.imageUrl,
                 candidateSourceUrl: candidate.imageSourceUrl,
+                mirroredStorageUrl: mirrored.publicUrl,
               },
               response: {
                 accepted: review.accepted,
