@@ -371,20 +371,87 @@ const normalizeSearchTerm = (value: string) =>
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
-const productImageSearchQueries = (input: { rawName: string; product: Record<string, unknown> }) => {
-  const rawName = asStringValue(input.rawName);
-  const name = asStringValue(input.product.name) || rawName;
+const nonProductReceiptLinePattern =
+  /\b(sconto|sconti|fidaty|fidati|punti|totale|subtotale|iva|pagamento|pos|resto|buono|coupon|promozione|risparmio|lotteria)\b/i;
+
+const industrialHallucinationPattern =
+  /\b(automazione|industriale|interruttore|protezione|guardmaster|rockwell|allen bradley|siemens|schneider|sensore|plc|contattore|motore)\b/i;
+
+const safeSearchName = (value: string) =>
+  value
+    .replace(nonProductReceiptLinePattern, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isUnsafeGroceryEnrichment = (
+  rawName: string,
+  currentCategory: string | undefined,
+  product: Record<string, unknown>,
+) => {
+  const proposedText = [
+    product.name,
+    product.category,
+    product.subcategory,
+    product.brand,
+    product.notes,
+    ...(Array.isArray(product.merchantCategories) ? product.merchantCategories : []),
+  ]
+    .map(asStringValue)
+    .filter(Boolean)
+    .join(" ");
+  const sourceLooksGrocery =
+    /(alimentari|alimentazione|spesa|supermercato|frutta|verdura|pane|pasta|carne|pesce|bevande|igiene|animali|pet|cane|gatto|ultima|gourmet|friskies|frsk|revelations|nutri|esselunga|coop|conad|carrefour|lidl|eurospin)/i.test(
+      `${rawName} ${currentCategory || ""}`,
+    );
+  return sourceLooksGrocery && industrialHallucinationPattern.test(proposedText);
+};
+
+const keepOnlySafeProductResearch = (
+  rawName: string,
+  currentCategory: string | undefined,
+  product: Record<string, unknown>,
+) => {
+  const unsafe = isUnsafeGroceryEnrichment(rawName, currentCategory, product);
+  const aliases = Array.isArray(product.aliases)
+    ? product.aliases.map(asStringValue).filter((alias) => alias && !industrialHallucinationPattern.test(alias))
+    : [];
+
+  product.name = rawName;
+  if (currentCategory) product.category = currentCategory;
+  product.aliases = Array.from(new Set([rawName, ...aliases]));
+
+  if (unsafe) {
+    delete product.subcategory;
+    delete product.brand;
+    delete product.weight;
+    delete product.unit;
+    product.confidence = Math.min(asOptionalNumber(product.confidence) ?? 0.5, 0.45);
+    product.enrichmentSource = "guardrail_rejected_ai_enrichment";
+    product.notes = "Arricchimento AI scartato: proposta incompatibile con una riga scontrino GDO.";
+    product.merchantCategories = [currentCategory || "Alimentari"];
+  }
+
+  return { product, unsafe };
+};
+
+const productImageSearchQueries = (input: { rawName: string; product: Record<string, unknown>; merchantName?: string }) => {
+  const rawName = safeSearchName(asStringValue(input.rawName));
+  const merchantName = safeSearchName(asStringValue(input.merchantName));
   const brand = asStringValue(input.product.brand);
   const weight = asStringValue(input.product.weight);
-  const base = [brand, name, weight].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const normalizedRaw = normalizeSearchTerm(rawName);
+  const brandIsGrounded = Boolean(brand && normalizedRaw.includes(normalizeSearchTerm(brand)));
+  const safeWeight = /^[\d.,]+\s?(g|gr|kg|ml|l|cl|pz|x\s?\d+)$/i.test(weight) ? weight : "";
+  const base = [brandIsGrounded ? brand : "", rawName, safeWeight].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
   const queries = [
+    merchantName ? `${base} ${merchantName} prodotto confezione sfondo bianco` : "",
     `${base} prodotto confezione sfondo bianco`,
     `${base} immagine prodotto`,
-    `${rawName} prodotto supermercato`,
+    merchantName ? `${rawName} ${merchantName} prodotto supermercato` : `${rawName} prodotto supermercato`,
   ]
     .map((query) => query.replace(/\b(sconto|fidaty|fidati|punti|totale|iva|pos)\b/gi, "").replace(/\s+/g, " ").trim())
     .filter((query) => query.length >= 4);
-  return Array.from(new Set(queries)).slice(0, 2);
+  return Array.from(new Set(queries)).slice(0, 3);
 };
 
 const trustedProductImageSourcePattern =
@@ -393,7 +460,7 @@ const trustedProductImageSourcePattern =
 const cleanPackshotPattern = /(packshot|confezione|prodotto|product|white|bianco|png|frontale|front)/i;
 const noisyImagePattern = /(recipe|ricetta|scaffale|shelf|volantino|catalogo|banner|promo|offerta|blog|news|article|ingredienti|ingredients)/i;
 
-const scoreProductImageCandidate = (item: Record<string, unknown>, productName: string) => {
+const scoreProductImageCandidate = (item: Record<string, unknown>, productName: string, merchantName?: string) => {
   const haystack = normalizeSearchTerm(
     [
       item.title,
@@ -415,17 +482,25 @@ const scoreProductImageCandidate = (item: Record<string, unknown>, productName: 
   const tokens = normalizeSearchTerm(productName)
     .split(" ")
     .filter((token) => token.length >= 3 && !["prod", "prodotto", "conf", "confezione", "supermercato"].includes(token));
+  if (industrialHallucinationPattern.test(haystack) && !industrialHallucinationPattern.test(productName)) {
+    return -100;
+  }
   const matches = tokens.filter((token) => haystack.includes(token)).length;
   const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const merchantTokens = normalizeSearchTerm(merchantName || "")
+    .split(" ")
+    .filter((token) => token.length >= 3);
+  const merchantMatch = merchantTokens.some((token) => haystack.includes(token));
   const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
   const cleanPackshot = cleanPackshotPattern.test(haystack);
   const noisyImage = noisyImagePattern.test(haystack);
-  return matches * 8 + (trustedDomain ? 14 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+  return matches * 8 + (trustedDomain ? 14 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
 };
 
 const fetchSerpApiGoogleImageCandidates = async (input: {
   rawName: string;
   product: Record<string, unknown>;
+  merchantName?: string;
 }): Promise<ProductImageCandidate[]> => {
   const apiKey = Deno.env.get("SERPAPI_API_KEY");
   if (!apiKey) return [];
@@ -452,7 +527,7 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
 
     const payload = await response.json() as { images_results?: unknown[] };
     const rows = Array.isArray(payload.images_results) ? payload.images_results : [];
-    const productName = asStringValue(input.product.name) || input.rawName;
+    const productName = safeSearchName(input.rawName);
     const seen = new Set<string>();
 
     return rows
@@ -461,11 +536,11 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
         const original = asStringValue(row.original);
         if (!/^https?:\/\//i.test(original) || seen.has(original) || Boolean(row.unsafe)) return null;
         seen.add(original);
-        const score = scoreProductImageCandidate(row, productName) + (row.is_product === true ? 16 : 0);
+        const score = scoreProductImageCandidate(row, productName, input.merchantName) + (row.is_product === true ? 16 : 0);
         return {
           candidate: {
             name: productName,
-            brand: asStringValue(input.product.brand) || undefined,
+            brand: undefined,
             weight: asStringValue(input.product.weight) || undefined,
             imageUrl: original,
             imageSource: "serpapi_google_images_light",
@@ -512,7 +587,7 @@ const extractApifySourceUrl = (item: Record<string, unknown>) => {
   return undefined;
 };
 
-const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: string) => {
+const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: string, merchantName?: string) => {
   const haystack = normalizeSearchTerm(
     [
       item.title,
@@ -532,17 +607,25 @@ const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: st
   const tokens = normalizeSearchTerm(productName)
     .split(" ")
     .filter((token) => token.length >= 3 && !["prod", "prodotto", "conf", "gr"].includes(token));
+  if (industrialHallucinationPattern.test(haystack) && !industrialHallucinationPattern.test(productName)) {
+    return -100;
+  }
   const matches = tokens.filter((token) => haystack.includes(token)).length;
   const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const merchantTokens = normalizeSearchTerm(merchantName || "")
+    .split(" ")
+    .filter((token) => token.length >= 3);
+  const merchantMatch = merchantTokens.some((token) => haystack.includes(token));
   const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
   const cleanPackshot = cleanPackshotPattern.test(haystack);
   const noisyImage = noisyImagePattern.test(haystack);
-  return matches * 8 + (trustedDomain ? 12 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+  return matches * 8 + (trustedDomain ? 12 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
 };
 
 const fetchApifyGoogleImageCandidates = async (input: {
   rawName: string;
   product: Record<string, unknown>;
+  merchantName?: string;
 }): Promise<ProductImageCandidate[]> => {
   const token = Deno.env.get("APIFY_API_TOKEN");
   if (!token) return [];
@@ -573,7 +656,7 @@ const fetchApifyGoogleImageCandidates = async (input: {
 
     const payload = await response.json();
     const rows = Array.isArray(payload) ? payload : flattenModelsPayload(payload);
-    const productName = asStringValue(input.product.name) || input.rawName;
+    const productName = safeSearchName(input.rawName);
     const seen = new Set<string>();
 
     return rows
@@ -582,11 +665,11 @@ const fetchApifyGoogleImageCandidates = async (input: {
         const imageUrl = extractApifyImageUrl(row);
         if (!imageUrl || seen.has(imageUrl)) return null;
         seen.add(imageUrl);
-        const score = scoreApifyImageCandidate(row, productName);
+        const score = scoreApifyImageCandidate(row, productName, input.merchantName);
         return {
           candidate: {
             name: productName,
-            brand: asStringValue(input.product.brand) || undefined,
+            brand: undefined,
             weight: asStringValue(input.product.weight) || undefined,
             imageUrl,
             imageSource: "apify_google_images",
@@ -764,7 +847,7 @@ Rispondi SOLO con questo JSON:
 {
   "documentType": "receipt | bank_statement | credit_card_statement | wallet_statement | prepaid_statement | invoice | transfer | other",
   "amount": numero,
-  "category": "Alimentari | Casa | Trasporti | Svago | Salute | Entrate | Altro",
+  "category": "Alimentari | Casa | Trasporti | Svago | Salute | Animali domestici | Cura personale | Entrate | Altro",
   "merchantName": string,
   "merchantAddress": string,
   "periodStart": "YYYY-MM-DD",
@@ -786,6 +869,7 @@ Regole:
 - Non includere mai totali, subtotali, IVA, pagamento carta, ricevute POS, resto, coupon, buoni, punti fedelta o righe sconto come prodotti.
 - Esempi da NON mettere in "items": "SCONTO FIDATY", "Sconto Fidaty", "Totale sconti", "Punti Fidaty", "Buono/Coupon", "Pagamento", "Resto", "IVA", "Totale", "Subtotale".
 - Se uno sconto e chiaramente collegato a un prodotto, valorizza "discountAmount" e "discountLabel" su quel prodotto; se lo sconto e generico, mettilo negli insight e non come prodotto.
+- Per scontrini supermercato, righe come "ULTIMA MAN&RIS 440G", "GOURMET", "FRSK/FRISKIES", "REVELATIONS" sono prodotti per animali domestici: non espanderle in prodotti industriali solo perche contengono codici/formati come 440G.
 - Per foto/PDF difficili usa confidenza bassa e warning negli insight.
 ${documentKind && documentKind !== "auto" ? `- L'utente ha indicato tipo documento probabile: ${documentKind}. Usalo come hint, ma correggilo se il documento dimostra altro.` : ""}
 ${text ? `\nTESTO DOCUMENTO:\n${text}` : ""}`;
@@ -839,8 +923,11 @@ Deno.serve(async (request) => {
       const currentCategory = args?.currentCategory ? String(args.currentCategory) : undefined;
       const allowImageSearch = Boolean(args?.allowImageSearch);
       const productId = args?.productId ? String(args.productId) : undefined;
-      const content = await completionV0(
-        `Sei un esperto di prodotti del mercato italiano. Arricchisci una voce prodotto per un catalogo globale.
+      const merchantName = args?.merchantName ? String(args.merchantName) : undefined;
+      const merchantHint = merchantName
+        ? `\nSupermercato/merchant dello scontrino: "${merchantName}". Usalo solo come contesto per marca, reparto e ricerca immagini: non inventare prodotti fuori dalla riga originale.`
+        : "";
+      const productResearchPrompt = `Sei un esperto di prodotti del mercato italiano. Arricchisci una voce prodotto per un catalogo globale.
 
 Rispondi SOLO con JSON:
 {
@@ -868,15 +955,23 @@ Regole immagini:
 - Le immagini automatiche sono consentite solo se il backend passa una fonte verificata.
 - Se non hai una fonte verificata, lascia "imageUrl": null.
 
-Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCategory}"` : ""}`,
-        { model: models.productResearch },
-      );
-      const product = extractJson(content, {
+Regole anti-allucinazione:
+- Non trasformare abbreviazioni da scontrino in prodotti di settori diversi.
+- Se la categoria attuale e' alimentare/GDO, non proporre prodotti industriali, elettronici, ricambi, automazione o B2B.
+- Il nome originale dello scontrino resta la fonte primaria: puoi suggerire marca/formato solo se coerenti, non sostituire il prodotto.
+- Il supermercato aiuta solo a scegliere fonti italiane e packshot coerenti.
+- I codici peso/formato come "440G" non bastano mai per cambiare identita o settore del prodotto.
+- Esempio importante: "ULTIMA MAN&RIS 440G" da scontrino Esselunga e' una riga GDO/pet food, non "Guardmaster 440G-MZ" e non Rockwell Automation. Se non sai espandere l'abbreviazione, lascia il nome originale e confidenza bassa.
+
+Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCategory}"` : ""}${merchantHint}`;
+      const content = await completionV0(productResearchPrompt, { model: models.productResearch });
+      const extractedProduct = extractJson(content, {
         name: productName,
         category: currentCategory || "Altro",
         confidence: 0.5,
         enrichmentSource: "straico",
       }) as Record<string, unknown>;
+      const { product, unsafe } = keepOnlySafeProductResearch(productName, currentCategory, extractedProduct);
 
       let imageCandidate: ProductImageCandidate | null = null;
       let mirroredImage: Awaited<ReturnType<typeof mirrorProductImageToStorage>> | null = null;
@@ -885,10 +980,14 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
       let imageSearchCandidatesFound = 0;
       let imageSearchCandidatesReviewed = 0;
       let imageSearchLastRejectReason: string | null = null;
-      if (allowImageSearch) {
+      if (allowImageSearch && unsafe) {
+        imageSearchStatus = "guardrail_rejected";
+        imageSearchLastRejectReason = "ai_product_metadata_incompatible_with_receipt_line";
+      }
+      if (allowImageSearch && !unsafe) {
         const candidateProviders: Array<() => Promise<ProductImageCandidate[]>> = [
-          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product }),
-          () => fetchApifyGoogleImageCandidates({ rawName: productName, product }),
+          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product, merchantName }),
+          () => fetchApifyGoogleImageCandidates({ rawName: productName, product, merchantName }),
           async () => {
             const candidate = await fetchOpenFoodFactsCandidate(productName);
             return candidate?.imageUrl ? [candidate] : [];
@@ -939,7 +1038,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
       }
 
       if (allowImageSearch && imageCandidate?.imageUrl && mirroredImage?.publicUrl) {
-        product.name = product.name || imageCandidate.name || productName;
+        product.name = productName;
         product.brand = product.brand || imageCandidate.brand;
         product.weight = product.weight || imageCandidate.weight;
         product.imageUrl = mirroredImage.publicUrl;
