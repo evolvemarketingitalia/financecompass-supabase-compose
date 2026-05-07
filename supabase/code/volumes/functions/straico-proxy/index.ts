@@ -803,10 +803,16 @@ const productImageSearchQueries = (input: { rawName: string; product: Record<str
 };
 
 const trustedProductImageSourcePattern =
-  /(esselunga|coop|conad|carrefour|pam|selex|despar|iper|crai|bennet|tigros|supermercato|supermercati|spesaonline|openfoodfacts|amazon|everli|cortilia|alce nero|barilla|mulino bianco|lavazza|granoro|rummo|granolo|granarolo|muller|dash|dixan|rio mare|mutti|findus|cameo|galbani|parmalat|nescafe|san benedetto|sant'anna|valfrutta|bauli|ferrero)/i;
+  /(esselunga|coop|conad|carrefour|pam|selex|despar|iper|crai|bennet|tigros|supermercato|supermercati|spesaonline|openfoodfacts|amazon|everli|cortilia|alce nero|barilla|mulino bianco|lavazza|granoro|rummo|granolo|granarolo|muller|dash|dixan|rio mare|mutti|findus|cameo|galbani|parmalat|nescafe|san benedetto|sant'anna|norda|levissima|lete|ferrarelle|rocchetta|sangemini|surgiva|panna|smeraldina|valfrutta|bauli|ferrero)/i;
 
 const cleanPackshotPattern = /(packshot|confezione|prodotto|product|white|bianco|png|frontale|front)/i;
 const noisyImagePattern = /(recipe|ricetta|scaffale|shelf|volantino|catalogo|banner|promo|offerta|blog|news|article|ingredienti|ingredients)/i;
+const commodityGroceryPattern =
+  /\b(acqua|norda|naturale|frizzante|minerale|latte|pomodorini|avocado|limone|lemonsoda|bevanda|pollo|biscotti|farro|orzo|orzoro)\b/i;
+const nonOverridableVisionRejectPattern =
+  /(unrelated|industrial|logo_only|shelf_or_recipe|ricetta|scaffale)/i;
+const differentProductVisionRejectPattern =
+  /(different_product|marca diversa|brand diverso|prodotto diverso|non corrisponde)/i;
 
 const scoreProductImageCandidate = (item: Record<string, unknown>, productName: string, merchantName?: string) => {
   const haystack = normalizeSearchTerm(
@@ -898,6 +904,46 @@ const shouldAcceptTrustedCandidateWhenVisionFails = (input: {
     /m\.media-amazon\.com|images[-.]openfoodfacts|cdn|media/i.test(input.candidate.imageUrl);
 
   return trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= 18;
+};
+
+const shouldAcceptTrustedCandidateDespiteVisionReject = (input: {
+  candidate: ProductImageCandidate;
+  productName: string;
+  product: Record<string, unknown>;
+  merchantName?: string;
+  review: ProductImageVisionReview;
+}) => {
+  if (!/^https?:\/\//i.test(input.candidate.imageUrl)) return false;
+  const candidateText = `${input.candidate.imageUrl} ${input.candidate.imageSourceUrl || ""} ${input.candidate.imageSource || ""} ${input.candidate.brand || ""}`;
+  if (industrialHallucinationPattern.test(candidateText) && !industrialHallucinationPattern.test(input.productName)) return false;
+  if (nonOverridableVisionRejectPattern.test(input.review.reason || "")) return false;
+
+  const fallbackScore = scoreProductImageCandidate(
+    {
+      title: input.candidate.imageSource === "openfoodfacts" ? input.candidate.name : "",
+      source: input.candidate.imageSource,
+      sourceUrl: input.candidate.imageSourceUrl,
+      imageUrl: input.candidate.imageUrl,
+      link: input.candidate.imageSourceUrl,
+      snippet: [input.candidate.brand, input.candidate.weight, ...(input.candidate.merchantCategories || [])].join(" "),
+    },
+    input.productName,
+    input.merchantName,
+  );
+  const tokenMatches = productImageTokenMatches(input.productName, input.candidate);
+  const productText = `${input.productName} ${asStringValue(input.product.name)} ${asStringValue(input.product.brand)} ${asStringValue(input.product.category)}`;
+  const commodityProduct = commodityGroceryPattern.test(productText);
+  const trustedSource =
+    trustedProductImageSourcePattern.test(`${input.candidate.imageSourceUrl || ""} ${input.candidate.imageUrl} ${input.candidate.imageSource}`) ||
+    input.candidate.imageSource === "openfoodfacts";
+  const directProductImage =
+    /\.(jpe?g|png|webp)(\?|$)/i.test(input.candidate.imageUrl) ||
+    /m\.media-amazon\.com|images[-.]openfoodfacts|cdn|media/i.test(input.candidate.imageUrl);
+  const requiredMatches = commodityProduct ? 1 : 2;
+  const visionSaysDifferentProduct = differentProductVisionRejectPattern.test(input.review.reason || "");
+  if (visionSaysDifferentProduct && !(commodityProduct && tokenMatches >= 2 && fallbackScore >= 34)) return false;
+
+  return trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= (commodityProduct ? 22 : 34);
 };
 
 const fetchSerpApiGoogleImageCandidates = async (input: {
@@ -1404,10 +1450,15 @@ Rispondi SOLO con questo JSON:
 Regole:
 - Spese negative in amount, entrate positive.
 - Non inventare importi o date mancanti.
+- Per ogni prodotto, "rawText" deve essere la riga originale esatta letta dallo scontrino, senza espansioni web.
+- Il campo "name" deve restare ancorato a "rawText": puoi sciogliere abbreviazioni evidenti di marca/prodotto solo se almeno marca o linea sono presenti nella riga originale.
+- Se non sei sicuro dell'espansione, usa come "name" il testo prodotto dello scontrino ripulito da IVA/prezzo e abbassa "confidence".
+- Non usare conoscenza web per trasformare codici o abbreviazioni ambigue in prodotti non dimostrati dalla riga originale.
 - Non includere mai totali, subtotali, IVA, pagamento carta, ricevute POS, resto, coupon, buoni, punti fedelta o righe sconto come prodotti.
 - Esempi da NON mettere in "items": "SCONTO FIDATY", "Sconto Fidaty", "Totale sconti", "Punti Fidaty", "Buono/Coupon", "Pagamento", "Resto", "IVA", "Totale", "Subtotale".
 - Se uno sconto e chiaramente collegato a un prodotto, valorizza "discountAmount" e "discountLabel" su quel prodotto; se lo sconto e generico, mettilo negli insight e non come prodotto.
 - Per scontrini supermercato, righe come "ULTIMA MAN&RIS 440G", "GOURMET", "FRSK/FRISKIES", "REVELATIONS" sono prodotti per animali domestici: non espanderle in prodotti industriali solo perche contengono codici/formati come 440G.
+- Esempio: se leggi "6BT NORDA NAT" puoi classificarlo come bevanda/acqua Norda, ma non devi cambiare brand o formato oltre quanto e plausibile dalla riga.
 - Per foto/PDF difficili usa confidenza bassa e warning negli insight.
 ${documentKind && documentKind !== "auto" ? `- L'utente ha indicato tipo documento probabile: ${documentKind}. Usalo come hint, ma correggilo se il documento dimostra altro.` : ""}
 ${text ? `\nTESTO DOCUMENTO:\n${text}` : ""}`;
@@ -1679,12 +1730,22 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               !review.accepted &&
               isVisionTechnicalFailure(review.reason) &&
               shouldAcceptTrustedCandidateWhenVisionFails({ candidate, productName, product, merchantName });
+            const trustedSourceOverrideAccepted =
+              !review.accepted &&
+              !fallbackAccepted &&
+              shouldAcceptTrustedCandidateDespiteVisionReject({ candidate, productName, product, merchantName, review });
             const finalReview = fallbackAccepted
               ? {
                   accepted: true,
                   confidence: Math.max(candidate.imageConfidence, 0.68),
                   reason: `trusted_source_fallback_after_${review.reason || "vision_error"}`,
                 }
+              : trustedSourceOverrideAccepted
+                ? {
+                    accepted: true,
+                    confidence: Math.max(candidate.imageConfidence, 0.66),
+                    reason: `trusted_source_override_after_${review.reason || "vision_rejected"}`,
+                  }
               : review;
             await logger({
               step: "vision_image_review",
@@ -1706,6 +1767,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
                 visionConfidence: review.confidence,
                 visionReason: review.reason,
                 fallbackAccepted,
+                trustedSourceOverrideAccepted,
               },
               error: finalReview.accepted ? undefined : finalReview.reason || "vision_rejected",
             });
