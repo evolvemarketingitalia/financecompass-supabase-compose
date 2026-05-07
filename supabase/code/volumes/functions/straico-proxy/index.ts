@@ -109,6 +109,52 @@ const getSupabase = () =>
     },
   });
 
+const getRequestSupabase = (authorization: string) =>
+  createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_ANON_KEY"), {
+    global: {
+      headers: {
+        Authorization: authorization,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+
+const getPublicSupabaseUrl = (fallback?: string) =>
+  (
+    Deno.env.get("SUPABASE_PUBLIC_URL") ||
+    Deno.env.get("API_EXTERNAL_URL") ||
+    fallback ||
+    "https://pfdb.evolvemarketing.cloud"
+  ).replace(/\/$/, "");
+
+const serviceRoleRest = async <T>(
+  publicSupabaseUrl: string | undefined,
+  path: string,
+  init: RequestInit,
+): Promise<{ data: T | null; error: string | null }> => {
+  try {
+    const serviceKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+    const response = await fetch(`${getPublicSupabaseUrl(publicSupabaseUrl)}/rest/v1/${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        ...(init.headers || {}),
+      },
+    });
+    const text = await response.text();
+    const data = text ? (JSON.parse(text) as T) : null;
+    if (!response.ok) return { data, error: JSON.stringify(data || text) };
+    return { data, error: null };
+  } catch (error) {
+    return { data: null, error: logErrorMessage(error) };
+  }
+};
+
 const assertUser = async (authorization: string | null) => {
   if (!authorization) throw new Error("Authorization mancante");
   const supabase = getSupabase();
@@ -120,6 +166,308 @@ const assertUser = async (authorization: string | null) => {
 
 const assertSuperAdmin = (user: { app_metadata?: Record<string, unknown> }) => {
   if (!user.app_metadata?.is_super_admin) throw new Error("superadmin required");
+};
+
+const LOG_SECRET_KEY_PATTERN = /(authorization|bearer|token|secret|password|api[_-]?key|apikey|service[_-]?role)/i;
+const MAX_LOG_STRING_LENGTH = 1800;
+const MAX_LOG_ARRAY_ITEMS = 12;
+const MAX_LOG_OBJECT_KEYS = 80;
+
+const sanitizeLogValue = (value: unknown, depth = 0): unknown => {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.startsWith("data:")) return `[data-url ${value.slice(0, 32)}...]`;
+    if (value.length > MAX_LOG_STRING_LENGTH) return `${value.slice(0, MAX_LOG_STRING_LENGTH)}...[truncated]`;
+    try {
+      const url = new URL(value);
+      for (const key of Array.from(url.searchParams.keys())) {
+        if (LOG_SECRET_KEY_PATTERN.test(key)) url.searchParams.set(key, "[redacted]");
+      }
+      return url.toString();
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value)) {
+    if (depth > 4) return `[array ${value.length}]`;
+    return value.slice(0, MAX_LOG_ARRAY_ITEMS).map((item) => sanitizeLogValue(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    if (depth > 4) return "[object]";
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .slice(0, MAX_LOG_OBJECT_KEYS)
+        .map(([key, item]) => [
+          key,
+          LOG_SECRET_KEY_PATTERN.test(key) ? "[redacted]" : sanitizeLogValue(item, depth + 1),
+        ]),
+    );
+  }
+  return String(value);
+};
+
+const logErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error || "Errore sconosciuto"));
+
+type ProductEnrichmentEventLog = {
+  step: string;
+  provider?: string;
+  status: "started" | "success" | "failed" | "skipped" | "rejected";
+  durationMs?: number;
+  request?: unknown;
+  response?: unknown;
+  error?: string;
+};
+
+type ProductEnrichmentLogger = (event: ProductEnrichmentEventLog) => Promise<void>;
+
+const getUserHouseholdId = async (userId: string) => {
+  try {
+    const { data } = await getSupabase()
+      .from("household_members")
+      .select("household_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    return data?.household_id ? String(data.household_id) : null;
+  } catch {
+    return null;
+  }
+};
+
+const createProductEnrichmentRun = async (input: {
+  authorization: string;
+  publicSupabaseUrl?: string;
+  productId?: string;
+  householdId?: string | null;
+  userId: string;
+  productName: string;
+  merchantName?: string;
+  category?: string;
+  requestedBy?: string;
+  modelProductResearch?: string;
+  modelVision?: string;
+  input: unknown;
+}) => {
+  const payload = {
+    productId: input.productId,
+    householdId: input.householdId || null,
+    productName: input.productName,
+    merchantName: input.merchantName,
+    category: input.category,
+    requestedBy: input.requestedBy || "catalog_ui",
+    modelProductResearch: input.modelProductResearch,
+    modelVision: input.modelVision,
+    input: sanitizeLogValue(input.input),
+  };
+
+  try {
+    const { data, error } = await getRequestSupabase(input.authorization).rpc("create_product_enrichment_run_log", {
+      payload,
+    });
+    if (!error && data) return String(data);
+    if (error) console.error("product_enrichment_run_rpc_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_run_rpc_failed", logErrorMessage(error));
+  }
+
+  try {
+    const { data, error } = await getSupabase()
+      .from("product_enrichment_runs")
+      .insert({
+        product_id: input.productId,
+        household_id: input.householdId || null,
+        user_id: input.userId,
+        product_name: input.productName,
+        merchant_name: input.merchantName,
+        category: input.category,
+        requested_by: input.requestedBy || "catalog_ui",
+        status: "started",
+        model_product_research: input.modelProductResearch,
+        model_vision: input.modelVision,
+        input_json: payload.input,
+      })
+      .select("id")
+      .single();
+    if (!error && data?.id) return String(data.id);
+    if (error) console.error("product_enrichment_run_direct_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_run_direct_failed", logErrorMessage(error));
+  }
+
+  const { data: restData, error: restError } = await serviceRoleRest<Array<{ id?: string }>>(
+    input.publicSupabaseUrl,
+    "product_enrichment_runs?select=id",
+    {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        product_id: input.productId,
+        household_id: input.householdId || null,
+        user_id: input.userId,
+        product_name: input.productName,
+        merchant_name: input.merchantName,
+        category: input.category,
+        requested_by: input.requestedBy || "catalog_ui",
+        status: "started",
+        model_product_research: input.modelProductResearch,
+        model_vision: input.modelVision,
+        input_json: payload.input,
+      }),
+    },
+  );
+  if (restData?.[0]?.id) return String(restData[0].id);
+  if (restError) console.error("product_enrichment_run_rest_failed", restError);
+
+  return null;
+};
+
+const logProductEnrichmentEvent = async (
+  authorization: string,
+  publicSupabaseUrl: string | undefined,
+  runId: string | null,
+  event: ProductEnrichmentEventLog,
+) => {
+  if (!runId) return;
+  const payload = {
+    step: event.step,
+    provider: event.provider,
+    status: event.status,
+    durationMs: event.durationMs,
+    request: sanitizeLogValue(event.request || {}),
+    response: sanitizeLogValue(event.response || {}),
+    error: event.error,
+  };
+
+  try {
+    const { error } = await getRequestSupabase(authorization).rpc("append_product_enrichment_event_log", {
+      target_run_id: runId,
+      payload,
+    });
+    if (!error) return;
+    console.error("product_enrichment_event_rpc_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_event_rpc_failed", logErrorMessage(error));
+  }
+
+  try {
+    const { error } = await getSupabase().from("product_enrichment_events").insert({
+      run_id: runId,
+      step: event.step,
+      provider: event.provider,
+      status: event.status,
+      duration_ms: event.durationMs,
+      request_json: payload.request,
+      response_json: payload.response,
+      error_message: event.error,
+    });
+    if (!error) return;
+    console.error("product_enrichment_event_direct_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_event_direct_failed", logErrorMessage(error));
+    // Diagnostics must never break the user-facing enrichment flow.
+  }
+
+  const { error: restError } = await serviceRoleRest(publicSupabaseUrl, "product_enrichment_events", {
+    method: "POST",
+    body: JSON.stringify({
+      run_id: runId,
+      step: event.step,
+      provider: event.provider,
+      status: event.status,
+      duration_ms: event.durationMs,
+      request_json: payload.request,
+      response_json: payload.response,
+      error_message: event.error,
+    }),
+  });
+  if (restError) console.error("product_enrichment_event_rest_failed", restError);
+};
+
+const finishProductEnrichmentRun = async (
+  authorization: string,
+  publicSupabaseUrl: string | undefined,
+  runId: string | null,
+  patch: {
+    status: "success" | "no_image" | "failed" | "guardrail_rejected";
+    imageSaved?: boolean;
+    imageUrl?: string | null;
+    imageSearchStatus?: string | null;
+    candidatesFound?: number;
+    candidatesReviewed?: number;
+    lastRejectReason?: string | null;
+    durationMs?: number;
+    output?: unknown;
+  },
+) => {
+  if (!runId) return;
+  const payload = {
+    status: patch.status,
+    imageSaved: Boolean(patch.imageSaved),
+    imageUrl: patch.imageUrl || null,
+    imageSearchStatus: patch.imageSearchStatus || null,
+    candidatesFound: patch.candidatesFound || 0,
+    candidatesReviewed: patch.candidatesReviewed || 0,
+    lastRejectReason: patch.lastRejectReason || null,
+    durationMs: patch.durationMs,
+    output: sanitizeLogValue(patch.output || {}),
+  };
+
+  try {
+    const { error } = await getRequestSupabase(authorization).rpc("finish_product_enrichment_run_log", {
+      target_run_id: runId,
+      payload,
+    });
+    if (!error) return;
+    console.error("product_enrichment_finish_rpc_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_finish_rpc_failed", logErrorMessage(error));
+  }
+
+  try {
+    const { error } = await getSupabase()
+      .from("product_enrichment_runs")
+      .update({
+        status: patch.status,
+        image_saved: Boolean(patch.imageSaved),
+        image_url: patch.imageUrl || null,
+        image_search_status: patch.imageSearchStatus || null,
+        candidates_found: patch.candidatesFound || 0,
+        candidates_reviewed: patch.candidatesReviewed || 0,
+        last_reject_reason: patch.lastRejectReason || null,
+        duration_ms: patch.durationMs,
+        output_json: payload.output,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId);
+    if (!error) return;
+    console.error("product_enrichment_finish_direct_failed", error.message);
+  } catch (error) {
+    console.error("product_enrichment_finish_direct_failed", logErrorMessage(error));
+    // Best-effort audit trail.
+  }
+
+  const { error: restError } = await serviceRoleRest(
+    publicSupabaseUrl,
+    `product_enrichment_runs?id=eq.${encodeURIComponent(runId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: patch.status,
+        image_saved: Boolean(patch.imageSaved),
+        image_url: patch.imageUrl || null,
+        image_search_status: patch.imageSearchStatus || null,
+        candidates_found: patch.candidatesFound || 0,
+        candidates_reviewed: patch.candidatesReviewed || 0,
+        last_reject_reason: patch.lastRejectReason || null,
+        duration_ms: patch.durationMs,
+        output_json: payload.output,
+        updated_at: new Date().toISOString(),
+      }),
+    },
+  );
+  if (restError) console.error("product_enrichment_finish_rest_failed", restError);
 };
 
 const getModelSettings = async (): Promise<StraicoModelSettings> => {
@@ -501,12 +849,31 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
   rawName: string;
   product: Record<string, unknown>;
   merchantName?: string;
+  logger?: ProductEnrichmentLogger;
 }): Promise<ProductImageCandidate[]> => {
   const apiKey = Deno.env.get("SERPAPI_API_KEY");
-  if (!apiKey) return [];
+  if (!apiKey) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "serpapi_google_images_light",
+      status: "skipped",
+      request: { rawName: input.rawName, merchantName: input.merchantName },
+      error: "SERPAPI_API_KEY missing",
+    });
+    return [];
+  }
 
   const query = productImageSearchQueries(input)[0];
-  if (!query) return [];
+  if (!query) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "serpapi_google_images_light",
+      status: "skipped",
+      request: { rawName: input.rawName, merchantName: input.merchantName },
+      error: "empty_search_query",
+    });
+    return [];
+  }
 
   const url = new URL("https://serpapi.com/search.json");
   url.searchParams.set("engine", "google_images_light");
@@ -518,19 +885,30 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
   url.searchParams.set("filter", "1");
   url.searchParams.set("api_key", apiKey);
 
+  const startedAt = performance.now();
   try {
     const response = await fetch(url.toString(), {
       headers: { Accept: "application/json", "User-Agent": "FinanceCompass/1.0 product-image-search" },
       signal: AbortSignal.timeout(25000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      await input.logger?.({
+        step: "image_search",
+        provider: "serpapi_google_images_light",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startedAt),
+        request: { query, gl: "it", hl: "it", safe: "active" },
+        response: { httpStatus: response.status, body: await response.text().catch(() => "") },
+      });
+      return [];
+    }
 
     const payload = await response.json() as { images_results?: unknown[] };
     const rows = Array.isArray(payload.images_results) ? payload.images_results : [];
     const productName = safeSearchName(input.rawName);
     const seen = new Set<string>();
 
-    return rows
+    const candidates = rows
       .map((row) => asRecord(row))
       .map((row) => {
         const original = asStringValue(row.original);
@@ -555,7 +933,32 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.candidate)
       .slice(0, 8);
-  } catch {
+    await input.logger?.({
+      step: "image_search",
+      provider: "serpapi_google_images_light",
+      status: "success",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { query, gl: "it", hl: "it", safe: "active", maxResultsUsed: 8 },
+      response: {
+        rawResults: rows.length,
+        selectedCandidates: candidates.map((candidate) => ({
+          imageUrl: candidate.imageUrl,
+          sourceUrl: candidate.imageSourceUrl,
+          source: candidate.imageSource,
+          confidence: candidate.imageConfidence,
+        })),
+      },
+    });
+    return candidates;
+  } catch (error) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "serpapi_google_images_light",
+      status: "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { query, gl: "it", hl: "it", safe: "active" },
+      error: logErrorMessage(error),
+    });
     return [];
   }
 };
@@ -626,18 +1029,38 @@ const fetchApifyGoogleImageCandidates = async (input: {
   rawName: string;
   product: Record<string, unknown>;
   merchantName?: string;
+  logger?: ProductEnrichmentLogger;
 }): Promise<ProductImageCandidate[]> => {
   const token = Deno.env.get("APIFY_API_TOKEN");
-  if (!token) return [];
+  if (!token) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "apify_google_images",
+      status: "skipped",
+      request: { rawName: input.rawName, merchantName: input.merchantName },
+      error: "APIFY_API_TOKEN missing",
+    });
+    return [];
+  }
 
   const queries = productImageSearchQueries(input);
-  if (!queries.length) return [];
+  if (!queries.length) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "apify_google_images",
+      status: "skipped",
+      request: { rawName: input.rawName, merchantName: input.merchantName },
+      error: "empty_search_query",
+    });
+    return [];
+  }
 
   const actorId = Deno.env.get("APIFY_GOOGLE_IMAGES_ACTOR_ID") || "tnudF2IxzORPhg4r8";
   const url = new URL(`https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items`);
   url.searchParams.set("timeout", "90");
   url.searchParams.set("clean", "true");
 
+  const startedAt = performance.now();
   try {
     const response = await fetch(url.toString(), {
       method: "POST",
@@ -652,14 +1075,24 @@ const fetchApifyGoogleImageCandidates = async (input: {
       }),
       signal: AbortSignal.timeout(100000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      await input.logger?.({
+        step: "image_search",
+        provider: "apify_google_images",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startedAt),
+        request: { actorId, queries, maxResultsPerQuery: 8 },
+        response: { httpStatus: response.status, body: await response.text().catch(() => "") },
+      });
+      return [];
+    }
 
     const payload = await response.json();
     const rows = Array.isArray(payload) ? payload : flattenModelsPayload(payload);
     const productName = safeSearchName(input.rawName);
     const seen = new Set<string>();
 
-    return rows
+    const candidates = rows
       .map((row) => asRecord(row))
       .map((row) => {
         const imageUrl = extractApifyImageUrl(row);
@@ -684,7 +1117,32 @@ const fetchApifyGoogleImageCandidates = async (input: {
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.candidate)
       .slice(0, 6);
-  } catch {
+    await input.logger?.({
+      step: "image_search",
+      provider: "apify_google_images",
+      status: "success",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { actorId, queries, maxResultsPerQuery: 8 },
+      response: {
+        rawResults: rows.length,
+        selectedCandidates: candidates.map((candidate) => ({
+          imageUrl: candidate.imageUrl,
+          sourceUrl: candidate.imageSourceUrl,
+          source: candidate.imageSource,
+          confidence: candidate.imageConfidence,
+        })),
+      },
+    });
+    return candidates;
+  } catch (error) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "apify_google_images",
+      status: "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { actorId, queries, maxResultsPerQuery: 8 },
+      error: logErrorMessage(error),
+    });
     return [];
   }
 };
@@ -879,7 +1337,9 @@ Deno.serve(async (request) => {
   if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
   try {
-    const user = await assertUser(request.headers.get("Authorization"));
+    const authorization = request.headers.get("Authorization");
+    const publicSupabaseUrl = getPublicSupabaseUrl(new URL(request.url).origin);
+    const user = await assertUser(authorization);
     const { action, args } = await request.json();
     const models = await getModelSettings();
 
@@ -919,11 +1379,41 @@ Deno.serve(async (request) => {
     }
 
     if (action === "product_enrich") {
+      const runStartedAt = performance.now();
       const productName = String(args?.productName || "");
       const currentCategory = args?.currentCategory ? String(args.currentCategory) : undefined;
       const allowImageSearch = Boolean(args?.allowImageSearch);
       const productId = args?.productId ? String(args.productId) : undefined;
       const merchantName = args?.merchantName ? String(args.merchantName) : undefined;
+      const householdId = await getUserHouseholdId(user.id);
+      const runId = await createProductEnrichmentRun({
+        authorization: authorization!,
+        publicSupabaseUrl,
+        productId,
+        householdId,
+        userId: user.id,
+        productName,
+        merchantName,
+        category: currentCategory,
+        modelProductResearch: models.productResearch,
+        modelVision: models.documentAnalysis,
+        input: {
+          action,
+          productName,
+          currentCategory,
+          allowImageSearch,
+          productId,
+          merchantName,
+          constraints: [
+            "catalog only",
+            "no API keys in browser",
+            "GDO image search only",
+            "store mirrored images in Supabase Storage",
+          ],
+        },
+      });
+      const logger: ProductEnrichmentLogger = (event) =>
+        logProductEnrichmentEvent(authorization!, publicSupabaseUrl, runId, event);
       const merchantHint = merchantName
         ? `\nSupermercato/merchant dello scontrino: "${merchantName}". Usalo solo come contesto per marca, reparto e ricerca immagini: non inventare prodotti fuori dalla riga originale.`
         : "";
@@ -964,7 +1454,26 @@ Regole anti-allucinazione:
 - Esempio importante: "ULTIMA MAN&RIS 440G" da scontrino Esselunga e' una riga GDO/pet food, non "Guardmaster 440G-MZ" e non Rockwell Automation. Se non sai espandere l'abbreviazione, lascia il nome originale e confidenza bassa.
 
 Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCategory}"` : ""}${merchantHint}`;
-      const content = await completionV0(productResearchPrompt, { model: models.productResearch });
+      let content = "";
+      const metadataStartedAt = performance.now();
+      try {
+        content = await completionV0(productResearchPrompt, { model: models.productResearch });
+      } catch (error) {
+        await logger({
+          step: "product_metadata_research",
+          provider: "straico",
+          status: "failed",
+          durationMs: Math.round(performance.now() - metadataStartedAt),
+          request: { model: models.productResearch, productName, currentCategory, merchantName, prompt: productResearchPrompt },
+          error: logErrorMessage(error),
+        });
+        await finishProductEnrichmentRun(authorization!, publicSupabaseUrl, runId, {
+          status: "failed",
+          durationMs: Math.round(performance.now() - runStartedAt),
+          output: { error: logErrorMessage(error) },
+        });
+        throw error;
+      }
       const extractedProduct = extractJson(content, {
         name: productName,
         category: currentCategory || "Altro",
@@ -972,6 +1481,15 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         enrichmentSource: "straico",
       }) as Record<string, unknown>;
       const { product, unsafe } = keepOnlySafeProductResearch(productName, currentCategory, extractedProduct);
+      await logger({
+        step: "product_metadata_research",
+        provider: "straico",
+        status: unsafe ? "rejected" : "success",
+        durationMs: Math.round(performance.now() - metadataStartedAt),
+        request: { model: models.productResearch, productName, currentCategory, merchantName, prompt: productResearchPrompt },
+        response: { rawContent: content, extractedProduct, safeProduct: product, unsafe },
+        error: unsafe ? "metadata_incompatible_with_receipt_line_guardrail" : undefined,
+      });
 
       let imageCandidate: ProductImageCandidate | null = null;
       let mirroredImage: Awaited<ReturnType<typeof mirrorProductImageToStorage>> | null = null;
@@ -983,13 +1501,40 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
       if (allowImageSearch && unsafe) {
         imageSearchStatus = "guardrail_rejected";
         imageSearchLastRejectReason = "ai_product_metadata_incompatible_with_receipt_line";
+        await logger({
+          step: "image_search_guardrail",
+          provider: "financecompass",
+          status: "rejected",
+          request: { productName, currentCategory, merchantName, allowImageSearch },
+          response: { imageSearchStatus, imageSearchLastRejectReason, product },
+          error: imageSearchLastRejectReason,
+        });
       }
       if (allowImageSearch && !unsafe) {
         const candidateProviders: Array<() => Promise<ProductImageCandidate[]>> = [
-          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product, merchantName }),
-          () => fetchApifyGoogleImageCandidates({ rawName: productName, product, merchantName }),
+          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
+          () => fetchApifyGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
           async () => {
+            const startedAt = performance.now();
             const candidate = await fetchOpenFoodFactsCandidate(productName);
+            await logger({
+              step: "image_search",
+              provider: "openfoodfacts",
+              status: candidate?.imageUrl ? "success" : "success",
+              durationMs: Math.round(performance.now() - startedAt),
+              request: { productName },
+              response: {
+                selectedCandidates: candidate?.imageUrl
+                  ? [{
+                      imageUrl: candidate.imageUrl,
+                      source: candidate.imageSource,
+                      confidence: candidate.imageConfidence,
+                      name: candidate.name,
+                      brand: candidate.brand,
+                    }]
+                  : [],
+              },
+            });
             return candidate?.imageUrl ? [candidate] : [];
           },
         ];
@@ -1001,6 +1546,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
           imageSearchCandidatesFound += candidates.length;
           for (const candidate of candidates) {
             if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
+            const mirrorStartedAt = performance.now();
             const mirrored = await mirrorProductImageToStorage({
               sourceUrl: candidate.imageUrl,
               productName: candidate.name || asStringValue(product.name) || productName,
@@ -1008,16 +1554,64 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
             });
             if (!mirrored?.publicUrl) {
               imageSearchStatus = "candidate_download_failed";
+              await logger({
+                step: "candidate_download_and_storage",
+                provider: candidate.imageSource,
+                status: "failed",
+                durationMs: Math.round(performance.now() - mirrorStartedAt),
+                request: {
+                  sourceUrl: candidate.imageUrl,
+                  sourcePage: candidate.imageSourceUrl,
+                  productName: candidate.name || productName,
+                },
+                error: "download_or_storage_upload_failed",
+              });
               continue;
             }
+            await logger({
+              step: "candidate_download_and_storage",
+              provider: candidate.imageSource,
+              status: "success",
+              durationMs: Math.round(performance.now() - mirrorStartedAt),
+              request: {
+                sourceUrl: candidate.imageUrl,
+                sourcePage: candidate.imageSourceUrl,
+                productName: candidate.name || productName,
+              },
+              response: {
+                publicUrl: mirrored.publicUrl,
+                storagePath: mirrored.storagePath,
+                contentType: mirrored.contentType,
+                size: mirrored.size,
+              },
+            });
 
             visionReviews += 1;
             imageSearchCandidatesReviewed = visionReviews;
+            const visionStartedAt = performance.now();
             const review = await reviewProductImageWithVision({
               productName,
               product,
               imageUrl: mirrored.publicUrl,
               model: models.documentAnalysis,
+            });
+            await logger({
+              step: "vision_image_review",
+              provider: "straico",
+              status: review.accepted ? "success" : "rejected",
+              durationMs: Math.round(performance.now() - visionStartedAt),
+              request: {
+                model: models.documentAnalysis,
+                productName,
+                candidateImageUrl: mirrored.publicUrl,
+                candidateSourceUrl: candidate.imageSourceUrl,
+              },
+              response: {
+                accepted: review.accepted,
+                confidence: review.confidence,
+                reason: review.reason,
+              },
+              error: review.accepted ? undefined : review.reason || "vision_rejected",
             });
 
             if (review.accepted) {
@@ -1030,6 +1624,13 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
             imageSearchStatus = "vision_rejected";
             imageSearchLastRejectReason = review.reason || null;
             await removeProductImageFromStorage(mirrored.storagePath);
+            await logger({
+              step: "storage_cleanup",
+              provider: PRODUCT_IMAGE_BUCKET,
+              status: "success",
+              request: { storagePath: mirrored.storagePath, reason: review.reason || "vision_rejected" },
+              response: { removed: true },
+            });
           }
           if (mirroredImage?.publicUrl) {
             break;
@@ -1070,6 +1671,33 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.imageSearchCandidatesReviewed = imageSearchCandidatesReviewed;
         product.imageSearchLastRejectReason = imageSearchLastRejectReason;
       }
+
+      const imageSaved = Boolean(allowImageSearch && product.imageUrl);
+      const finalRunStatus = allowImageSearch
+        ? unsafe
+          ? "guardrail_rejected"
+          : imageSaved
+            ? "success"
+            : "no_image"
+        : "success";
+      await finishProductEnrichmentRun(authorization!, publicSupabaseUrl, runId, {
+        status: finalRunStatus,
+        imageSaved,
+        imageUrl: asStringValue(product.imageUrl) || null,
+        imageSearchStatus,
+        candidatesFound: imageSearchCandidatesFound,
+        candidatesReviewed: imageSearchCandidatesReviewed,
+        lastRejectReason: imageSearchLastRejectReason || asStringValue(product.imageVisionReason) || null,
+        durationMs: Math.round(performance.now() - runStartedAt),
+        output: {
+          product,
+          imageSaved,
+          imageSearchStatus,
+          imageSearchCandidatesFound,
+          imageSearchCandidatesReviewed,
+          imageSearchLastRejectReason,
+        },
+      });
 
       return json({
         product,
