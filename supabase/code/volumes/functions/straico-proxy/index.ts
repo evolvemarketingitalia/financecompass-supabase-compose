@@ -845,6 +845,61 @@ const scoreProductImageCandidate = (item: Record<string, unknown>, productName: 
   return matches * 8 + (trustedDomain ? 14 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
 };
 
+const productImageTokenMatches = (productName: string, candidate: ProductImageCandidate) => {
+  const haystack = normalizeSearchTerm(
+    [
+      candidate.brand,
+      candidate.weight,
+      candidate.imageUrl,
+      candidate.imageSource,
+      candidate.imageSourceUrl,
+      ...(candidate.merchantCategories || []),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  const tokens = normalizeSearchTerm(productName)
+    .split(" ")
+    .filter((token) => token.length >= 3 && !["con", "per", "del", "dell", "della", "prodotto", "mousse"].includes(token));
+  return tokens.filter((token) => haystack.includes(token)).length;
+};
+
+const isVisionTechnicalFailure = (reason?: string) =>
+  /vision_(fetch_failed|review_failed|model_error)|fetch_failed|model_error|timeout|network/i.test(reason || "");
+
+const shouldAcceptTrustedCandidateWhenVisionFails = (input: {
+  candidate: ProductImageCandidate;
+  productName: string;
+  product: Record<string, unknown>;
+  merchantName?: string;
+}) => {
+  if (!/^https?:\/\//i.test(input.candidate.imageUrl)) return false;
+  if (industrialHallucinationPattern.test(`${input.candidate.imageUrl} ${input.candidate.imageSourceUrl || ""}`)) return false;
+
+  const fallbackScore = scoreProductImageCandidate(
+    {
+      title: input.candidate.imageSource === "openfoodfacts" ? input.candidate.name : "",
+      source: input.candidate.imageSource,
+      sourceUrl: input.candidate.imageSourceUrl,
+      imageUrl: input.candidate.imageUrl,
+      link: input.candidate.imageSourceUrl,
+      snippet: [input.candidate.brand, input.candidate.weight, ...(input.candidate.merchantCategories || [])].join(" "),
+    },
+    input.productName,
+    input.merchantName,
+  );
+  const tokenMatches = productImageTokenMatches(input.productName, input.candidate);
+  const requiredMatches = normalizeSearchTerm(input.productName).split(" ").filter((token) => token.length >= 4).length <= 1 ? 1 : 2;
+  const trustedSource =
+    trustedProductImageSourcePattern.test(`${input.candidate.imageSourceUrl || ""} ${input.candidate.imageUrl} ${input.candidate.imageSource}`) ||
+    input.candidate.imageSource === "openfoodfacts";
+  const directProductImage =
+    /\.(jpe?g|png|webp)(\?|$)/i.test(input.candidate.imageUrl) ||
+    /m\.media-amazon\.com|images[-.]openfoodfacts|cdn|media/i.test(input.candidate.imageUrl);
+
+  return trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= 18;
+};
+
 const fetchSerpApiGoogleImageCandidates = async (input: {
   rawName: string;
   product: Record<string, unknown>;
@@ -1151,8 +1206,26 @@ const PRODUCT_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 const PRODUCT_IMAGE_BUCKET = "product-images";
 const PRODUCT_IMAGE_VISION_REVIEW_LIMIT = 3;
 
+const getExternalSupabaseUrl = () => {
+  const configured = (
+    Deno.env.get("PRODUCT_IMAGE_PUBLIC_BASE_URL") ||
+    Deno.env.get("SUPABASE_PUBLIC_URL") ||
+    Deno.env.get("API_EXTERNAL_URL") ||
+    "https://pfdb.evolvemarketing.cloud"
+  ).replace(/\/$/, "");
+  try {
+    const url = new URL(configured);
+    if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|kong)$/i.test(url.hostname)) {
+      return "https://pfdb.evolvemarketing.cloud";
+    }
+  } catch {
+    return "https://pfdb.evolvemarketing.cloud";
+  }
+  return configured;
+};
+
 const publicStorageUrl = (bucket: string, path: string) =>
-  `${getPublicSupabaseUrl()}/storage/v1/object/public/${bucket}/${path
+  `${getExternalSupabaseUrl()}/storage/v1/object/public/${bucket}/${path
     .split("/")
     .map(encodeURIComponent)
     .join("/")}`;
@@ -1602,10 +1675,21 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               imageUrl: candidate.imageUrl,
               model: models.documentAnalysis,
             });
+            const fallbackAccepted =
+              !review.accepted &&
+              isVisionTechnicalFailure(review.reason) &&
+              shouldAcceptTrustedCandidateWhenVisionFails({ candidate, productName, product, merchantName });
+            const finalReview = fallbackAccepted
+              ? {
+                  accepted: true,
+                  confidence: Math.max(candidate.imageConfidence, 0.68),
+                  reason: `trusted_source_fallback_after_${review.reason || "vision_error"}`,
+                }
+              : review;
             await logger({
               step: "vision_image_review",
               provider: "straico",
-              status: review.accepted ? "success" : "rejected",
+              status: finalReview.accepted ? "success" : "rejected",
               durationMs: Math.round(performance.now() - visionStartedAt),
               request: {
                 model: models.documentAnalysis,
@@ -1615,28 +1699,32 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
                 mirroredStorageUrl: mirrored.publicUrl,
               },
               response: {
-                accepted: review.accepted,
-                confidence: review.confidence,
-                reason: review.reason,
+                accepted: finalReview.accepted,
+                confidence: finalReview.confidence,
+                reason: finalReview.reason,
+                visionAccepted: review.accepted,
+                visionConfidence: review.confidence,
+                visionReason: review.reason,
+                fallbackAccepted,
               },
-              error: review.accepted ? undefined : review.reason || "vision_rejected",
+              error: finalReview.accepted ? undefined : finalReview.reason || "vision_rejected",
             });
 
-            if (review.accepted) {
+            if (finalReview.accepted) {
               imageCandidate = candidate;
               mirroredImage = mirrored;
-              imageVisionReview = review;
+              imageVisionReview = finalReview;
               imageSearchStatus = "accepted";
               break;
             }
             imageSearchStatus = "vision_rejected";
-            imageSearchLastRejectReason = review.reason || null;
+            imageSearchLastRejectReason = finalReview.reason || null;
             await removeProductImageFromStorage(mirrored.storagePath);
             await logger({
               step: "storage_cleanup",
               provider: PRODUCT_IMAGE_BUCKET,
               status: "success",
-              request: { storagePath: mirrored.storagePath, reason: review.reason || "vision_rejected" },
+              request: { storagePath: mirrored.storagePath, reason: finalReview.reason || "vision_rejected" },
               response: { removed: true },
             });
           }
