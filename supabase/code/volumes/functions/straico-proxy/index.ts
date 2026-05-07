@@ -532,6 +532,19 @@ const getExactCount = async (supabase: ReturnType<typeof getSupabase>, table: st
   return count || 0;
 };
 
+const getExactCountExcludingStatus = async (
+  supabase: ReturnType<typeof getSupabase>,
+  table: string,
+  excludedStatus: string,
+) => {
+  const { count, error } = await supabase
+    .from(table)
+    .select("*", { count: "exact", head: true })
+    .neq("status", excludedStatus);
+  if (error) throw new Error(`admin_count_${table}_failed: ${error.message}`);
+  return count || 0;
+};
+
 const selectAdminRows = async <T>(
   supabase: ReturnType<typeof getSupabase>,
   table: string,
@@ -580,8 +593,8 @@ const getAdminPlatformOverview = async () => {
   ] = await Promise.all([
     listAdminAuthUsers(supabase),
     getExactCount(supabase, "households"),
-    getExactCount(supabase, "transactions"),
-    getExactCount(supabase, "documents"),
+    getExactCountExcludingStatus(supabase, "transactions", "deleted"),
+    getExactCountExcludingStatus(supabase, "documents", "rejected"),
     getExactCount(supabase, "products"),
     selectAdminRows<{ user_id: string; display_name?: string; created_at?: string }>(
       supabase,
