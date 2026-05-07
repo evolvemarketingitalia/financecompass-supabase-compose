@@ -809,6 +809,8 @@ const cleanPackshotPattern = /(packshot|confezione|prodotto|product|white|bianco
 const noisyImagePattern = /(recipe|ricetta|scaffale|shelf|volantino|catalogo|banner|promo|offerta|blog|news|article|ingredienti|ingredients)/i;
 const commodityGroceryPattern =
   /\b(acqua|norda|naturale|frizzante|minerale|latte|pomodorini|avocado|limone|lemonsoda|bevanda|pollo|biscotti|farro|orzo|orzoro)\b/i;
+const groceryCommerceSourcePattern =
+  /(\.it\/|spesa|supermercato|supermercati|alimentari|bevande|drink|casa|shop|store|prodotto|product)/i;
 const nonOverridableVisionRejectPattern =
   /(unrelated|industrial|logo_only|shelf_or_recipe|ricetta|scaffale)/i;
 const differentProductVisionRejectPattern =
@@ -873,6 +875,48 @@ const productImageTokenMatches = (productName: string, candidate: ProductImageCa
 const isVisionTechnicalFailure = (reason?: string) =>
   /vision_(fetch_failed|review_failed|model_error)|fetch_failed|model_error|timeout|network/i.test(reason || "");
 
+const isCommodityGroceryProduct = (input: {
+  productName: string;
+  product: Record<string, unknown>;
+}) => {
+  const productText = `${input.productName} ${asStringValue(input.product.name)} ${asStringValue(input.product.brand)} ${asStringValue(input.product.category)}`;
+  return commodityGroceryPattern.test(productText);
+};
+
+const hasStrongCommodityProductEvidence = (input: {
+  candidate: ProductImageCandidate;
+  productName: string;
+  product: Record<string, unknown>;
+  merchantName?: string;
+}) => {
+  if (!isCommodityGroceryProduct(input)) return false;
+  const candidateText = `${input.candidate.imageUrl} ${input.candidate.imageSourceUrl || ""} ${input.candidate.imageSource || ""} ${input.candidate.brand || ""} ${(input.candidate.merchantCategories || []).join(" ")}`;
+  if (industrialHallucinationPattern.test(candidateText) && !industrialHallucinationPattern.test(input.productName)) return false;
+  if (noisyImagePattern.test(candidateText)) return false;
+
+  const directProductImage =
+    /\.(jpe?g|png|webp)(\?|$)/i.test(input.candidate.imageUrl) ||
+    /m\.media-amazon\.com|images[-.]openfoodfacts|cdn|media|wp-content|uploads/i.test(input.candidate.imageUrl);
+  if (!directProductImage) return false;
+
+  const fallbackScore = scoreProductImageCandidate(
+    {
+      title: input.candidate.imageSource === "openfoodfacts" ? input.candidate.name : "",
+      source: input.candidate.imageSource,
+      sourceUrl: input.candidate.imageSourceUrl,
+      imageUrl: input.candidate.imageUrl,
+      link: input.candidate.imageSourceUrl,
+      snippet: [input.candidate.brand, input.candidate.weight, ...(input.candidate.merchantCategories || [])].join(" "),
+    },
+    input.productName,
+    input.merchantName,
+  );
+  const tokenMatches = productImageTokenMatches(input.productName, input.candidate);
+  const sourceLooksLikeGroceryCommerce = groceryCommerceSourcePattern.test(candidateText);
+
+  return sourceLooksLikeGroceryCommerce && tokenMatches >= 2 && fallbackScore >= 24;
+};
+
 const shouldAcceptTrustedCandidateWhenVisionFails = (input: {
   candidate: ProductImageCandidate;
   productName: string;
@@ -903,7 +947,8 @@ const shouldAcceptTrustedCandidateWhenVisionFails = (input: {
     /\.(jpe?g|png|webp)(\?|$)/i.test(input.candidate.imageUrl) ||
     /m\.media-amazon\.com|images[-.]openfoodfacts|cdn|media/i.test(input.candidate.imageUrl);
 
-  return trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= 18;
+  const trustedCandidate = trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= 18;
+  return trustedCandidate || hasStrongCommodityProductEvidence(input);
 };
 
 const shouldAcceptTrustedCandidateDespiteVisionReject = (input: {
@@ -943,7 +988,8 @@ const shouldAcceptTrustedCandidateDespiteVisionReject = (input: {
   const visionSaysDifferentProduct = differentProductVisionRejectPattern.test(input.review.reason || "");
   if (visionSaysDifferentProduct && !(commodityProduct && tokenMatches >= 2 && fallbackScore >= 34)) return false;
 
-  return trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= (commodityProduct ? 22 : 34);
+  const trustedCandidate = trustedSource && directProductImage && tokenMatches >= requiredMatches && fallbackScore >= (commodityProduct ? 22 : 34);
+  return trustedCandidate || (commodityProduct && hasStrongCommodityProductEvidence(input));
 };
 
 const fetchSerpApiGoogleImageCandidates = async (input: {
