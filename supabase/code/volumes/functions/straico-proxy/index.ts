@@ -521,6 +521,188 @@ const getNestedNumber = (record: Record<string, unknown>, keys: string[]) => {
   return undefined;
 };
 
+const toMillis = (value: unknown) => {
+  const time = typeof value === "string" ? Date.parse(value) : Number(value);
+  return Number.isFinite(time) ? time : 0;
+};
+
+const getExactCount = async (supabase: ReturnType<typeof getSupabase>, table: string) => {
+  const { count, error } = await supabase.from(table).select("*", { count: "exact", head: true });
+  if (error) throw new Error(`admin_count_${table}_failed: ${error.message}`);
+  return count || 0;
+};
+
+const selectAdminRows = async <T>(
+  supabase: ReturnType<typeof getSupabase>,
+  table: string,
+  columns: string,
+): Promise<T[]> => {
+  const { data, error } = await supabase.from(table).select(columns);
+  if (error) throw new Error(`admin_select_${table}_failed: ${error.message}`);
+  return (data || []) as T[];
+};
+
+const listAdminAuthUsers = async (supabase: ReturnType<typeof getSupabase>) => {
+  const users: Array<{
+    id: string;
+    email?: string;
+    created_at?: string;
+    last_sign_in_at?: string;
+    email_confirmed_at?: string;
+    app_metadata?: Record<string, unknown>;
+    user_metadata?: Record<string, unknown>;
+  }> = [];
+
+  for (let page = 1; page <= 10; page += 1) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 200 });
+    if (error) throw new Error(`admin_auth_users_failed: ${error.message}`);
+    const batch = data.users || [];
+    users.push(...batch);
+    if (batch.length < 200) break;
+  }
+
+  return users;
+};
+
+const getAdminPlatformOverview = async () => {
+  const supabase = getSupabase();
+  const [
+    authUsers,
+    householdsCount,
+    transactionsCount,
+    documentsCount,
+    productsCount,
+    profiles,
+    households,
+    memberships,
+    transactionRefs,
+    documentRefs,
+  ] = await Promise.all([
+    listAdminAuthUsers(supabase),
+    getExactCount(supabase, "households"),
+    getExactCount(supabase, "transactions"),
+    getExactCount(supabase, "documents"),
+    getExactCount(supabase, "products"),
+    selectAdminRows<{ user_id: string; display_name?: string; created_at?: string }>(
+      supabase,
+      "user_profiles",
+      "user_id,display_name,created_at",
+    ),
+    selectAdminRows<{ id: string; name: string; created_by?: string; created_at?: string }>(
+      supabase,
+      "households",
+      "id,name,created_by,created_at",
+    ),
+    selectAdminRows<{ household_id: string; user_id: string; role?: string; created_at?: string }>(
+      supabase,
+      "household_members",
+      "household_id,user_id,role,created_at",
+    ),
+    selectAdminRows<{ household_id: string; status?: string }>(supabase, "transactions", "household_id,status"),
+    selectAdminRows<{ household_id: string; status?: string }>(supabase, "documents", "household_id,status"),
+  ]);
+
+  const profileByUserId = new Map(profiles.map((profile) => [profile.user_id, profile]));
+  const householdById = new Map(households.map((household) => [household.id, household]));
+  const authUserById = new Map(authUsers.map((authUser) => [authUser.id, authUser]));
+  const firstMembershipByUserId = new Map<string, { household_id: string; role?: string; created_at?: string }>();
+  const membersCountByHouseholdId = new Map<string, number>();
+
+  memberships.forEach((membership) => {
+    membersCountByHouseholdId.set(
+      membership.household_id,
+      (membersCountByHouseholdId.get(membership.household_id) || 0) + 1,
+    );
+    const current = firstMembershipByUserId.get(membership.user_id);
+    if (!current || toMillis(membership.created_at) < toMillis(current.created_at)) {
+      firstMembershipByUserId.set(membership.user_id, membership);
+    }
+  });
+
+  const transactionsCountByHouseholdId = new Map<string, number>();
+  transactionRefs.forEach((transaction) => {
+    if (transaction.status === "deleted") return;
+    transactionsCountByHouseholdId.set(
+      transaction.household_id,
+      (transactionsCountByHouseholdId.get(transaction.household_id) || 0) + 1,
+    );
+  });
+
+  const documentsCountByHouseholdId = new Map<string, number>();
+  documentRefs.forEach((document) => {
+    if (document.status === "rejected") return;
+    documentsCountByHouseholdId.set(
+      document.household_id,
+      (documentsCountByHouseholdId.get(document.household_id) || 0) + 1,
+    );
+  });
+
+  const users = authUsers
+    .map((authUser) => {
+      const profile = profileByUserId.get(authUser.id);
+      const metadata = asRecord(authUser.user_metadata || {});
+      const membership = firstMembershipByUserId.get(authUser.id);
+      const household = membership ? householdById.get(membership.household_id) : undefined;
+      const email = authUser.email || "";
+      return {
+        id: authUser.id,
+        email: email || "Email non disponibile",
+        name:
+          asStringValue(profile?.display_name) ||
+          asStringValue(metadata.name) ||
+          asStringValue(metadata.full_name) ||
+          email.split("@")[0] ||
+          "Utente",
+        isSuperAdmin: Boolean(asRecord(authUser.app_metadata || {}).is_super_admin),
+        householdId: household?.id,
+        householdName: household?.name,
+        role: membership?.role,
+        createdAt: toMillis(authUser.created_at || profile?.created_at),
+        lastSignInAt: authUser.last_sign_in_at ? toMillis(authUser.last_sign_in_at) : undefined,
+        emailConfirmed: Boolean(authUser.email_confirmed_at),
+      };
+    })
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 200);
+
+  const householdSummaries = households
+    .map((household) => {
+      const owner = household.created_by ? authUserById.get(household.created_by) : undefined;
+      const ownerProfile = household.created_by ? profileByUserId.get(household.created_by) : undefined;
+      const ownerMetadata = asRecord(owner?.user_metadata || {});
+      return {
+        id: household.id,
+        name: household.name || "Famiglia",
+        ownerUserId: household.created_by,
+        ownerEmail: owner?.email || undefined,
+        ownerName:
+          asStringValue(ownerProfile?.display_name) ||
+          asStringValue(ownerMetadata.name) ||
+          asStringValue(ownerMetadata.full_name) ||
+          owner?.email?.split("@")[0] ||
+          undefined,
+        membersCount: membersCountByHouseholdId.get(household.id) || 0,
+        transactionsCount: transactionsCountByHouseholdId.get(household.id) || 0,
+        documentsCount: documentsCountByHouseholdId.get(household.id) || 0,
+        createdAt: toMillis(household.created_at),
+      };
+    })
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 200);
+
+  return {
+    counts: {
+      users: authUsers.length,
+      households: householdsCount,
+      transactions: transactionsCount,
+      documents: documentsCount,
+      products: productsCount,
+    },
+    users,
+    households: householdSummaries,
+  };
+};
+
 const modelCostLabel = (input?: number, output?: number, max?: number, rawCost?: string) => {
   if (rawCost) return rawCost;
   const parts: string[] = [];
@@ -1536,6 +1718,14 @@ Deno.serve(async (request) => {
       assertSuperAdmin(user);
       return json({
         models: await fetchStraicoModels(),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "platform_overview") {
+      assertSuperAdmin(user);
+      return json({
+        overview: await getAdminPlatformOverview(),
         fetchedAt: new Date().toISOString(),
       });
     }
