@@ -256,6 +256,18 @@ const sanitizeLogValue = (value: unknown, depth = 0): unknown => {
 
 const logErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error || "Errore sconosciuto"));
 
+const isMissingSchemaColumnError = (error: unknown, column: string) => {
+  const message = logErrorMessage(error).toLowerCase();
+  const normalizedColumn = column.toLowerCase();
+  return (
+    message.includes(`'${normalizedColumn}' column`) ||
+    message.includes(`column '${normalizedColumn}'`) ||
+    message.includes(`column "${normalizedColumn}"`) ||
+    message.includes(`column ${normalizedColumn}`) ||
+    message.includes(`${normalizedColumn}' in the schema cache`)
+  );
+};
+
 type ProductEnrichmentEventLog = {
   step: string;
   provider?: string;
@@ -1217,13 +1229,27 @@ const fetchOfficialCatalogImageCandidates = async (input: {
 
     const tokens = Array.from(new Set(catalogTokens(input.rawName, source.key).filter((token) => token.length >= 3))).slice(0, 4);
     const rowsById = new Map<string, Record<string, unknown>>();
+    const selectFields =
+      "id,source_name,source_normalized_name,source_description,source_brand,source_weight,source_unit,source_category,source_aliases,source_product_url,source_image_url,source_image_public_url,source_image_storage_path,confidence";
+    const fallbackSelectFields =
+      "id,source_name,source_normalized_name,source_description,source_brand,source_weight,source_unit,source_category,source_product_url,source_image_url,source_image_public_url,source_image_storage_path,confidence";
     for (const token of tokens) {
-      const { data, error } = await supabase
+      let { data, error } = await supabase
         .from("product_external_refs")
-        .select("id,source_name,source_normalized_name,source_description,source_brand,source_weight,source_unit,source_category,source_aliases,source_product_url,source_image_url,source_image_public_url,source_image_storage_path,confidence")
+        .select(selectFields)
         .eq("source_id", catalogSource.id)
         .ilike("source_normalized_name", `%${token}%`)
         .limit(60);
+      if (error && isMissingSchemaColumnError(error, "source_aliases")) {
+        const retry = await supabase
+          .from("product_external_refs")
+          .select(fallbackSelectFields)
+          .eq("source_id", catalogSource.id)
+          .ilike("source_normalized_name", `%${token}%`)
+          .limit(60);
+        data = retry.data;
+        error = retry.error;
+      }
       if (error) {
         await input.logger?.({
           step: "image_search",
@@ -2164,9 +2190,17 @@ const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: 
         }
       }
       const ref = esselungaProductToExternalRef(url, product, imageMirror);
-      const { error } = await getSupabase()
+      const payload = { ...ref, source_id: sourceId };
+      let { error } = await getSupabase()
         .from("product_external_refs")
-        .upsert({ ...ref, source_id: sourceId }, { onConflict: "source_id,source_product_url" });
+        .upsert(payload, { onConflict: "source_id,source_product_url" });
+      if (error && isMissingSchemaColumnError(error, "source_aliases")) {
+        const { source_aliases: _sourceAliases, ...fallbackPayload } = payload;
+        const retry = await getSupabase()
+          .from("product_external_refs")
+          .upsert(fallbackPayload, { onConflict: "source_id,source_product_url" });
+        error = retry.error;
+      }
       if (error) throw new Error(`product_external_refs_upsert_failed:${error.message}`);
       ok += 1;
       results.push({
