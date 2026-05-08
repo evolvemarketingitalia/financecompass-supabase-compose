@@ -92,10 +92,57 @@ const requireEnv = (key: string) => {
   return value;
 };
 
+const firstBalancedJsonObject = (content: string) => {
+  const start = content.indexOf("{");
+  if (start < 0) return "";
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = inString;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) return content.slice(start, index + 1);
+  }
+
+  return "";
+};
+
 const extractJson = <T>(content: string, fallback: T): T => {
+  const candidates = [
+    content.trim(),
+    content.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim() || "",
+    firstBalancedJsonObject(content),
+  ].filter(Boolean);
+
   try {
-    const match = content.match(/\{[\s\S]*\}/);
-    return match ? (JSON.parse(match[0]) as T) : fallback;
+    for (const candidate of candidates) {
+      try {
+        return JSON.parse(candidate) as T;
+      } catch {
+        // Try the next candidate: providers often wrap JSON in prose or markdown fences.
+      }
+    }
+    return fallback;
   } catch {
     return fallback;
   }
@@ -893,6 +940,7 @@ type ProductImageCandidate = {
   imageSource: string;
   imageSourceUrl?: string;
   merchantCategories?: string[];
+  contextText?: string;
   imageConfidence: number;
 };
 
@@ -977,16 +1025,69 @@ const keepOnlySafeProductResearch = (
   return { product, unsafe };
 };
 
+const officialSupermarketCatalogSources = [
+  { key: "esselunga", tokens: ["esselunga", "s lunga", "slunga"], domains: ["spesaonline.esselunga.it", "esselunga.it"] },
+  { key: "coop", tokens: ["coop"], domains: ["easycoop.com", "coopshop.it", "coop.it"] },
+  { key: "conad", tokens: ["conad"], domains: ["spesaonline.conad.it", "conad.it"] },
+  { key: "carrefour", tokens: ["carrefour"], domains: ["carrefour.it"] },
+  { key: "bennet", tokens: ["bennet"], domains: ["bennet.com"] },
+  { key: "eurospin", tokens: ["eurospin"], domains: ["eurospin.it"] },
+  { key: "lidl", tokens: ["lidl"], domains: ["lidl.it"] },
+  { key: "aldi", tokens: ["aldi"], domains: ["aldi.it"] },
+  { key: "md", tokens: ["md", "md spa"], domains: ["mdspa.it"] },
+  { key: "dm", tokens: ["dm", "dm drogerie"], domains: ["dm-drogeriemarkt.it"] },
+];
+
+const officialCatalogSourceForMerchant = (merchantName?: string) => {
+  const normalizedMerchant = normalizeSearchTerm(merchantName || "");
+  if (!normalizedMerchant) return undefined;
+  const merchantTokens = normalizedMerchant.split(" ").filter(Boolean);
+  return officialSupermarketCatalogSources
+    .find((source) =>
+      source.tokens.some((token) => {
+        const normalizedToken = normalizeSearchTerm(token);
+        return normalizedToken.length <= 2
+          ? merchantTokens.includes(normalizedToken)
+          : normalizedMerchant.includes(normalizedToken);
+      }),
+    );
+};
+
+const officialDomainsForMerchant = (merchantName?: string) => {
+  const source = officialCatalogSourceForMerchant(merchantName);
+  return source?.domains || [];
+};
+
+const isOfficialMerchantCatalogUrl = (value: string, merchantName?: string) => {
+  const normalizedValue = normalizeSearchTerm(value);
+  return officialDomainsForMerchant(merchantName).some((domain) => normalizedValue.includes(normalizeSearchTerm(domain)));
+};
+
 const productImageSearchQueries = (input: { rawName: string; product: Record<string, unknown>; merchantName?: string }) => {
   const rawName = safeSearchName(asStringValue(input.rawName));
   const merchantName = safeSearchName(asStringValue(input.merchantName));
   const brand = asStringValue(input.product.brand);
   const weight = asStringValue(input.product.weight);
+  const officialDomains = officialDomainsForMerchant(merchantName);
   const normalizedRaw = normalizeSearchTerm(rawName);
   const brandIsGrounded = Boolean(brand && normalizedRaw.includes(normalizeSearchTerm(brand)));
   const safeWeight = /^[\d.,]+\s?(g|gr|kg|ml|l|cl|pz|x\s?\d+)$/i.test(weight) ? weight : "";
   const base = [brandIsGrounded ? brand : "", rawName, safeWeight].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const freshProduceExclusions =
+    isFreshProduceProductName(rawName)
+      ? "-yogurt -muller -kefir -confettura -marmellata -succo -nettare -frullato -dessert -cheesecake -crostata -gelato -mousse"
+      : "";
+  const freshProduceQueries = isFreshProduceProductName(rawName)
+    ? [
+        ...officialDomains.slice(0, 2).map((domain) => `site:${domain} ${base || rawName} frutta fresca vaschetta ${freshProduceExclusions}`),
+        merchantName ? `${base || rawName} ${merchantName} frutta fresca vaschetta ${freshProduceExclusions}` : "",
+        `${base || rawName} frutta fresca vaschetta confezione ${freshProduceExclusions}`,
+      ]
+    : [];
   const queries = [
+    ...freshProduceQueries,
+    ...officialDomains.slice(0, 2).map((domain) => `site:${domain} ${base || rawName}`),
+    ...officialDomains.slice(0, 1).map((domain) => `${rawName} ${merchantName} site:${domain}`),
     merchantName ? `${base} ${merchantName} prodotto confezione sfondo bianco` : "",
     `${base} prodotto confezione sfondo bianco`,
     `${base} immagine prodotto`,
@@ -994,14 +1095,217 @@ const productImageSearchQueries = (input: { rawName: string; product: Record<str
   ]
     .map((query) => query.replace(/\b(sconto|fidaty|fidati|punti|totale|iva|pos)\b/gi, "").replace(/\s+/g, " ").trim())
     .filter((query) => query.length >= 4);
-  return Array.from(new Set(queries)).slice(0, 3);
+  return Array.from(new Set(queries)).slice(0, 4);
+};
+
+const catalogTokenStopwords = new Set([
+  "a",
+  "al",
+  "alla",
+  "con",
+  "da",
+  "del",
+  "dell",
+  "della",
+  "di",
+  "e",
+  "g",
+  "gr",
+  "il",
+  "in",
+  "la",
+  "le",
+  "l",
+  "ml",
+  "per",
+  "pz",
+  "x",
+  "prodotto",
+  "supermercato",
+]);
+
+const expandCatalogAbbreviations = (value: string, merchantKey?: string) => {
+  let next = ` ${normalizeSearchTerm(value)} `;
+  next = next
+    .replace(/\bsg\b/g, " sgusciate ")
+    .replace(/\bnat\b/g, " naturale ")
+    .replace(/\bfriz\b/g, " frizzante ")
+    .replace(/\b6bt\b/g, " 6 bottiglie ")
+    .replace(/\bbt\b/g, " bottiglie ");
+  if (merchantKey === "esselunga") next = next.replace(/\bsl\b/g, " esselunga ");
+  return normalizeSearchTerm(next);
+};
+
+const catalogTokens = (value: string, merchantKey?: string) =>
+  expandCatalogAbbreviations(value, merchantKey)
+    .split(" ")
+    .filter((token) => token.length >= 2 && !catalogTokenStopwords.has(token) && !/^\d+$/.test(token));
+
+const scoreOfficialCatalogRef = (productName: string, ref: Record<string, unknown>, merchantKey?: string) => {
+  const inputTokens = catalogTokens(productName, merchantKey)
+    .filter((token) => token !== merchantKey && token.length >= 3);
+  const candidateText = [
+    ref.source_name,
+    ref.source_normalized_name,
+    ref.source_description,
+    ref.source_brand,
+    ref.source_weight,
+    ref.source_unit,
+    ref.source_category,
+    ...(Array.isArray(ref.source_aliases) ? ref.source_aliases : []),
+  ]
+    .map(asStringValue)
+    .join(" ");
+  if (isFreshProduceProductName(productName) && freshProduceIncompatiblePattern.test(normalizeSearchTerm(candidateText))) {
+    return -1;
+  }
+  const candidateTokens = new Set(catalogTokens(candidateText, merchantKey));
+  if (!inputTokens.length || !candidateTokens.size) return 0;
+  const matched = new Set(
+    inputTokens.filter(
+      (token) =>
+        candidateTokens.has(token) ||
+        (token.length >= 5 &&
+          Array.from(candidateTokens).some((candidateToken) => candidateToken.length >= 5 && candidateToken.includes(token))),
+    ),
+  );
+  if (!inputTokens.some((token) => token.length >= 4 && matched.has(token))) return 0;
+  const coverage = matched.size / inputTokens.length;
+  const precision = matched.size / Math.max(1, Math.min(candidateTokens.size, inputTokens.length + 4));
+  const hasImage = Boolean(asStringValue(ref.source_image_public_url) || asStringValue(ref.source_image_url));
+  return Math.min(1, coverage * 0.7 + precision * 0.22 + (hasImage ? 0.08 : 0));
+};
+
+const fetchOfficialCatalogImageCandidates = async (input: {
+  rawName: string;
+  product: Record<string, unknown>;
+  merchantName?: string;
+  logger?: ProductEnrichmentLogger;
+}): Promise<ProductImageCandidate[]> => {
+  const source = officialCatalogSourceForMerchant(input.merchantName);
+  const startedAt = performance.now();
+  if (!source) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "official_catalog",
+      status: "skipped",
+      request: { productName: input.rawName, merchantName: input.merchantName },
+      response: { reason: "merchant_not_supported" },
+    });
+    return [];
+  }
+
+  try {
+    const supabase = getSupabase();
+    const { data: catalogSource, error: sourceError } = await supabase
+      .from("retail_catalog_sources")
+      .select("id")
+      .eq("merchant_key", source.key)
+      .eq("enabled", true)
+      .maybeSingle();
+    if (sourceError || !catalogSource?.id) {
+      await input.logger?.({
+        step: "image_search",
+        provider: "official_catalog",
+        status: "failed",
+        durationMs: Math.round(performance.now() - startedAt),
+        request: { merchantKey: source.key, productName: input.rawName },
+        error: sourceError?.message || "catalog_source_not_found",
+      });
+      return [];
+    }
+
+    const tokens = Array.from(new Set(catalogTokens(input.rawName, source.key).filter((token) => token.length >= 3))).slice(0, 4);
+    const rowsById = new Map<string, Record<string, unknown>>();
+    for (const token of tokens) {
+      const { data, error } = await supabase
+        .from("product_external_refs")
+        .select("id,source_name,source_normalized_name,source_description,source_brand,source_weight,source_unit,source_category,source_aliases,source_product_url,source_image_url,source_image_public_url,source_image_storage_path,confidence")
+        .eq("source_id", catalogSource.id)
+        .ilike("source_normalized_name", `%${token}%`)
+        .limit(60);
+      if (error) {
+        await input.logger?.({
+          step: "image_search",
+          provider: "official_catalog",
+          status: "failed",
+          durationMs: Math.round(performance.now() - startedAt),
+          request: { merchantKey: source.key, token, productName: input.rawName },
+          error: error.message,
+        });
+        return [];
+      }
+      (data || []).forEach((row) => rowsById.set(String(row.id), asRecord(row)));
+    }
+
+    const candidates = Array.from(rowsById.values())
+      .map((row) => ({ row, score: scoreOfficialCatalogRef(input.rawName, row, source.key) }))
+      .filter(({ row, score }) => score >= 0.46 && (asStringValue(row.source_image_public_url) || asStringValue(row.source_image_url)))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6)
+      .map(({ row, score }) => ({
+        name: asStringValue(row.source_name) || safeSearchName(input.rawName),
+        brand: asStringValue(row.source_brand) || asStringValue(input.product.brand) || undefined,
+        weight: asStringValue(row.source_weight) || asStringValue(input.product.weight) || undefined,
+        imageUrl: asStringValue(row.source_image_public_url) || asStringValue(row.source_image_url),
+        imageSource: `official_catalog_${source.key}`,
+        imageSourceUrl: asStringValue(row.source_product_url) || asStringValue(row.source_image_url),
+        merchantCategories: [
+          "Catalogo ufficiale",
+          source.key,
+          asStringValue(row.source_category),
+          asStringValue(row.source_name),
+        ].filter(Boolean),
+        contextText: [
+          asStringValue(row.source_name),
+          asStringValue(row.source_description),
+          asStringValue(row.source_brand),
+          asStringValue(row.source_product_url),
+          asStringValue(row.source_image_url),
+        ].filter(Boolean).join(" "),
+        imageConfidence: Math.max(0.72, Math.min(0.96, score)),
+      }));
+
+    await input.logger?.({
+      step: "image_search",
+      provider: "official_catalog",
+      status: "success",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { merchantKey: source.key, productName: input.rawName, tokens },
+      response: {
+        rawResults: rowsById.size,
+        selectedCandidates: candidates.map((candidate) => ({
+          name: candidate.name,
+          imageUrl: candidate.imageUrl,
+          sourceUrl: candidate.imageSourceUrl,
+          confidence: candidate.imageConfidence,
+        })),
+      },
+    });
+
+    return candidates;
+  } catch (error) {
+    await input.logger?.({
+      step: "image_search",
+      provider: "official_catalog",
+      status: "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      request: { merchantKey: source.key, productName: input.rawName },
+      error: logErrorMessage(error),
+    });
+    return [];
+  }
 };
 
 const trustedProductImageSourcePattern =
-  /(esselunga|coop|conad|carrefour|pam|selex|despar|iper|crai|bennet|tigros|supermercato|supermercati|spesaonline|openfoodfacts|amazon|everli|cortilia|alce nero|barilla|mulino bianco|lavazza|granoro|rummo|granolo|granarolo|muller|dash|dixan|rio mare|mutti|findus|cameo|galbani|parmalat|nescafe|san benedetto|sant'anna|norda|levissima|lete|ferrarelle|rocchetta|sangemini|surgiva|panna|smeraldina|valfrutta|bauli|ferrero)/i;
+  /(esselunga|coop|conad|carrefour|pam|selex|despar|iper|crai|bennet|tigros|eurospin|lidl|aldi|mdspa|dm-drogeriemarkt|supermercato|supermercati|spesaonline|openfoodfacts|amazon|everli|cortilia|alce nero|barilla|mulino bianco|lavazza|granoro|rummo|granolo|granarolo|muller|dash|dixan|rio mare|mutti|findus|cameo|galbani|parmalat|nescafe|san benedetto|sant'anna|norda|levissima|lete|ferrarelle|rocchetta|sangemini|surgiva|panna|smeraldina|valfrutta|bauli|ferrero)/i;
 
 const cleanPackshotPattern = /(packshot|confezione|prodotto|product|white|bianco|png|frontale|front)/i;
 const noisyImagePattern = /(recipe|ricetta|scaffale|shelf|volantino|catalogo|banner|promo|offerta|blog|news|article|ingredienti|ingredients)/i;
+const freshProduceProductPattern =
+  /\b(lamponi|lampone|mirtilli|mirtillo|fragole|fragola|more|ribes|ribesrosso|uva|pere|pera|mele|mela|banane|banana|kiwi|pesche|pesca|albicocche|albicocca|ciliegie|ciliegia|limoni|limone|arance|arancia|mandarini|mandarino|avocado|pomodorini|pomodori|pomodoro|insalata|zucchine|zucchina|carote|carota)\b/i;
+const freshProduceIncompatiblePattern =
+  /\b(yogurt|yomo|muller|fage|vipiteno|kefir|skyr|frullato|smoothie|succo|nettare|bevanda|drink|confettura|marmellata|composta|crema|dessert|cheesecake|crostata|torta|gelato|sorbetto|mousse|barretta|barrette|biscotto|biscotti|caramelle|gelee|infuso|tisana|te|integratore|maschera|viso|shampoo|salsa|sciroppo|ripieni|ricoperti|cioccolato|cacao)\b/i;
 const commodityGroceryPattern =
   /\b(acqua|norda|naturale|frizzante|minerale|latte|pomodorini|avocado|limone|lemonsoda|bevanda|pollo|biscotti|farro|orzo|orzoro)\b/i;
 const groceryCommerceSourcePattern =
@@ -1010,6 +1314,30 @@ const nonOverridableVisionRejectPattern =
   /(unrelated|industrial|logo_only|shelf_or_recipe|ricetta|scaffale)/i;
 const differentProductVisionRejectPattern =
   /(different_product|marca diversa|brand diverso|prodotto diverso|non corrisponde)/i;
+
+const isFreshProduceProductName = (productName: string) => {
+  const normalized = normalizeSearchTerm(productName);
+  return freshProduceProductPattern.test(normalized) && !freshProduceIncompatiblePattern.test(normalized);
+};
+
+const productImageCandidateContext = (candidate: ProductImageCandidate) =>
+  normalizeSearchTerm(
+    [
+      candidate.name,
+      candidate.brand,
+      candidate.weight,
+      candidate.imageUrl,
+      candidate.imageSource,
+      candidate.imageSourceUrl,
+      candidate.contextText,
+      ...(candidate.merchantCategories || []),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+
+const rejectIncompatibleProductImageCandidate = (productName: string, candidate: ProductImageCandidate) =>
+  isFreshProduceProductName(productName) && freshProduceIncompatiblePattern.test(productImageCandidateContext(candidate));
 
 const scoreProductImageCandidate = (item: Record<string, unknown>, productName: string, merchantName?: string) => {
   const haystack = normalizeSearchTerm(
@@ -1036,8 +1364,12 @@ const scoreProductImageCandidate = (item: Record<string, unknown>, productName: 
   if (industrialHallucinationPattern.test(haystack) && !industrialHallucinationPattern.test(productName)) {
     return -100;
   }
+  if (isFreshProduceProductName(productName) && freshProduceIncompatiblePattern.test(haystack)) {
+    return -120;
+  }
   const matches = tokens.filter((token) => haystack.includes(token)).length;
   const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const officialMerchantDomain = isOfficialMerchantCatalogUrl(haystack, merchantName);
   const merchantTokens = normalizeSearchTerm(merchantName || "")
     .split(" ")
     .filter((token) => token.length >= 3);
@@ -1045,22 +1377,11 @@ const scoreProductImageCandidate = (item: Record<string, unknown>, productName: 
   const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
   const cleanPackshot = cleanPackshotPattern.test(haystack);
   const noisyImage = noisyImagePattern.test(haystack);
-  return matches * 8 + (trustedDomain ? 14 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+  return matches * 8 + (officialMerchantDomain ? 34 : 0) + (trustedDomain ? 14 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
 };
 
 const productImageTokenMatches = (productName: string, candidate: ProductImageCandidate) => {
-  const haystack = normalizeSearchTerm(
-    [
-      candidate.brand,
-      candidate.weight,
-      candidate.imageUrl,
-      candidate.imageSource,
-      candidate.imageSourceUrl,
-      ...(candidate.merchantCategories || []),
-    ]
-      .filter(Boolean)
-      .join(" "),
-  );
+  const haystack = productImageCandidateContext(candidate);
   const tokens = normalizeSearchTerm(productName)
     .split(" ")
     .filter((token) => token.length >= 3 && !["con", "per", "del", "dell", "della", "prodotto", "mousse"].includes(token));
@@ -1265,13 +1586,22 @@ const fetchSerpApiGoogleImageCandidates = async (input: {
             imageUrl: original,
             imageSource: "serpapi_google_images_light",
             imageSourceUrl: asStringValue(row.link) || asStringValue(row.raw_link) || original,
-            merchantCategories: ["Google Images Light", "SerpApi", asStringValue(row.source)].filter(Boolean),
+            merchantCategories: ["Google Images Light", "SerpApi", asStringValue(row.source), asStringValue(row.title)].filter(Boolean),
+            contextText: [
+              asStringValue(row.title),
+              asStringValue(row.source),
+              asStringValue(row.link),
+              asStringValue(row.raw_link),
+              asStringValue(row.snippet),
+              asStringValue(row.original),
+            ].filter(Boolean).join(" "),
             imageConfidence: Math.min(0.9, 0.6 + Math.max(0, Math.min(score, 30)) / 100),
           } satisfies ProductImageCandidate,
           score,
         };
       })
       .filter((entry): entry is { candidate: ProductImageCandidate; score: number } => Boolean(entry))
+      .filter((entry) => entry.score > 0 && !rejectIncompatibleProductImageCandidate(productName, entry.candidate))
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.candidate)
       .slice(0, 8);
@@ -1357,6 +1687,7 @@ const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: st
   }
   const matches = tokens.filter((token) => haystack.includes(token)).length;
   const trustedDomain = trustedProductImageSourcePattern.test(haystack);
+  const officialMerchantDomain = isOfficialMerchantCatalogUrl(haystack, merchantName);
   const merchantTokens = normalizeSearchTerm(merchantName || "")
     .split(" ")
     .filter((token) => token.length >= 3);
@@ -1364,7 +1695,7 @@ const scoreApifyImageCandidate = (item: Record<string, unknown>, productName: st
   const producerDomain = /(\.it|\.com|\.eu)/i.test(haystack);
   const cleanPackshot = cleanPackshotPattern.test(haystack);
   const noisyImage = noisyImagePattern.test(haystack);
-  return matches * 8 + (trustedDomain ? 12 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
+  return matches * 8 + (officialMerchantDomain ? 34 : 0) + (trustedDomain ? 12 : 0) + (merchantMatch ? 8 : 0) + (producerDomain ? 2 : 0) + (cleanPackshot ? 5 : 0) - (noisyImage ? 8 : 0);
 };
 
 const fetchApifyGoogleImageCandidates = async (input: {
@@ -1449,13 +1780,25 @@ const fetchApifyGoogleImageCandidates = async (input: {
             imageUrl,
             imageSource: "apify_google_images",
             imageSourceUrl: extractApifySourceUrl(row) || imageUrl,
-            merchantCategories: ["Google Images", "Apify"],
+            merchantCategories: ["Google Images", "Apify", asStringValue(row.title), asStringValue(row.source)].filter(Boolean),
+            contextText: [
+              asStringValue(row.title),
+              asStringValue(row.source),
+              asStringValue(row.sourceUrl),
+              asStringValue(row.pageUrl),
+              asStringValue(row.origin),
+              asStringValue(row.contextUrl),
+              asStringValue(row.displayedUrl),
+              asStringValue(row.snippet),
+              imageUrl,
+            ].filter(Boolean).join(" "),
             imageConfidence: Math.min(0.86, 0.58 + Math.max(0, Math.min(score, 28)) / 100),
           } satisfies ProductImageCandidate,
           score,
         };
       })
       .filter((entry): entry is { candidate: ProductImageCandidate; score: number } => Boolean(entry))
+      .filter((entry) => entry.score > 0 && !rejectIncompatibleProductImageCandidate(productName, entry.candidate))
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.candidate)
       .slice(0, 6);
@@ -1604,6 +1947,293 @@ const removeProductImageFromStorage = async (storagePath: string) => {
   }
 };
 
+const ESSELUNGA_CATALOG_SOURCE = {
+  merchant_key: "esselunga",
+  merchant_name: "Esselunga",
+  official_domains: ["spesaonline.esselunga.it", "esselunga.it"],
+  search_domains: ["spesaonline.esselunga.it"],
+  scrape_status: "importing",
+  scrape_notes: "Catalogo ufficiale Esselunga usato come knowledge base locale per matching prodotti GDO.",
+};
+
+const decodeCatalogHtml = (value: unknown) =>
+  String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const esselungaProductCodeFromUrl = (url: string) => url.match(/\/prodotto\/(\d+)\//)?.[1] || "";
+
+const esselungaSlugFromUrl = (url: string) => {
+  try {
+    return decodeURIComponent(url.split("/").filter(Boolean).pop() || "").replace(/-/g, " ");
+  } catch {
+    return "";
+  }
+};
+
+const isEsselungaProductUrl = (url: string) =>
+  /^https:\/\/spesaonline\.esselunga\.it\/commerce\/nav\/supermercato\/store\/prodotto\/\d+\//i.test(url);
+
+const fetchEsselungaCatalogProduct = async (url: string) => {
+  const code = esselungaProductCodeFromUrl(url);
+  if (!code) throw new Error("esselunga_product_code_missing");
+  const response = await fetch(`https://spesaonline.esselunga.it/commerce/resources/displayable/detail/code/${code}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "FinanceCompassCatalogImporter/1.0 (+https://personalfinancecompass.vercel.app)",
+      "X-PAGE-PATH": "supermercato",
+      Referer: url,
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`esselunga_http_${response.status}:${text.slice(0, 160)}`);
+  const payload = JSON.parse(text) as Record<string, unknown>;
+  const product = asRecord(payload.displayableProduct || payload.product || payload);
+  if (!asStringValue(product.description)) throw new Error("esselunga_product_without_description");
+  return product;
+};
+
+const bestEsselungaImageUrl = (product: Record<string, unknown>) => {
+  const images = Array.isArray(product.images) ? product.images.map(asRecord) : [];
+  return (
+    asStringValue(product.imageURL) ||
+    asStringValue(images.find((image) => image.big)?.big) ||
+    asStringValue(images.find((image) => image.medium)?.medium) ||
+    asStringValue(images.find((image) => image.small)?.small)
+  );
+};
+
+const ensureEsselungaCatalogSource = async () => {
+  const { data, error } = await getSupabase()
+    .from("retail_catalog_sources")
+    .upsert({ ...ESSELUNGA_CATALOG_SOURCE, updated_at: new Date().toISOString() }, { onConflict: "merchant_key" })
+    .select("id")
+    .single();
+  if (error) throw new Error(`retail_catalog_sources_upsert_failed:${error.message}`);
+  return String(data.id);
+};
+
+const mirrorOfficialCatalogImageToStorage = async (input: {
+  sourceUrl: string;
+  sourceKey: string;
+  productCode: string;
+  productName: string;
+  referer?: string;
+}) => {
+  if (!input.sourceUrl) return {};
+  const response = await fetch(input.sourceUrl, {
+    headers: {
+      Accept: "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+      "User-Agent": "FinanceCompassCatalogImporter/1.0",
+      ...(input.referer ? { Referer: input.referer } : {}),
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`official_image_download_${response.status}`);
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "image/jpeg";
+  if (!isSupportedImageContentType(contentType)) throw new Error(`official_image_content_type_${contentType}`);
+  const declaredSize = Number(response.headers.get("content-length") || 0);
+  if (declaredSize > PRODUCT_IMAGE_MAX_BYTES) throw new Error("official_image_too_large");
+  const bytes = await response.arrayBuffer();
+  if (!bytes.byteLength || bytes.byteLength > PRODUCT_IMAGE_MAX_BYTES) throw new Error("official_image_invalid_size");
+  const ext = extensionFromContentType(contentType);
+  const hash = await sha256Short(bytes);
+  const path = `official/${normalizeStorageSegment(input.sourceKey)}/${normalizeStorageSegment(input.productCode || input.productName)}/${hash}.${ext}`;
+  const { error } = await getSupabase().storage.from(PRODUCT_IMAGE_BUCKET).upload(path, bytes, {
+    contentType,
+    cacheControl: "31536000",
+    upsert: true,
+  });
+  if (error) throw new Error(`official_image_upload_failed:${error.message}`);
+  return {
+    storagePath: path,
+    publicUrl: publicStorageUrl(PRODUCT_IMAGE_BUCKET, path),
+  };
+};
+
+const esselungaProductToExternalRef = (
+  url: string,
+  product: Record<string, unknown>,
+  imageMirror: { storagePath?: string; publicUrl?: string } = {},
+) => {
+  const name = decodeCatalogHtml(product.description);
+  const slugAlias = esselungaSlugFromUrl(url);
+  const unitValue = asStringValue(product.unitValue);
+  const unitText = asStringValue(product.unitText);
+  const brand = asStringValue(product.brand);
+  const code = asStringValue(product.code) || asStringValue(product.productId) || asStringValue(product.id) || esselungaProductCodeFromUrl(url);
+  const aliases = Array.from(
+    new Set(
+      [
+        name,
+        slugAlias,
+        brand ? `${brand} ${name}` : "",
+        asStringValue(product.barcode),
+        code,
+      ].filter(Boolean),
+    ),
+  );
+  const price = Number(product.discountedPrice ?? product.price);
+  return {
+    source_product_id: code,
+    source_product_url: url,
+    source_image_url: bestEsselungaImageUrl(product) || null,
+    source_image_storage_path: imageMirror.storagePath || null,
+    source_image_public_url: imageMirror.publicUrl || null,
+    source_name: name,
+    source_normalized_name: normalizeSearchTerm([name, brand, unitValue, unitText, slugAlias].filter(Boolean).join(" ")),
+    source_description: decodeCatalogHtml(
+      [
+        product.htmlDescription,
+        product.familyAttributes,
+        product.originRawMaterialText,
+        product.longDescription,
+        product.label,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    ),
+    source_brand: brand || null,
+    source_weight: [unitValue, unitText].filter(Boolean).join(" ") || null,
+    source_unit: unitText || null,
+    source_category: [product.productType, product.grmCode, product.subGrmCode].map(asStringValue).filter(Boolean).join(" / ") || null,
+    source_aliases: aliases,
+    source_price: Number.isFinite(price) ? price : null,
+    source_currency: "EUR",
+    confidence: 0.95,
+    metadata: {
+      barcode: asStringValue(product.barcode) || null,
+      vat: product.vat ?? null,
+      unitValue: unitValue || null,
+      unitText: unitText || null,
+      outOfStock: Boolean(product.outOfStock),
+      importedFrom: "esselunga_displayable_detail_code",
+    },
+    last_seen_at: new Date().toISOString(),
+  };
+};
+
+const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: boolean; max?: unknown }) => {
+  const rawUrls = Array.isArray(input.urls) ? input.urls : [];
+  const urls = Array.from(new Set(rawUrls.map(asStringValue).filter(isEsselungaProductUrl))).slice(
+    0,
+    Math.max(1, Math.min(Number(input.max) || 75, 150)),
+  );
+  const startedAt = performance.now();
+  const sourceId = await ensureEsselungaCatalogSource();
+  const results: Array<{
+    status: "ok" | "failed";
+    url: string;
+    code?: string;
+    name?: string;
+    imageSaved?: boolean;
+    imageError?: string;
+    error?: string;
+  }> = [];
+  let ok = 0;
+  let failed = 0;
+  let imagesSaved = 0;
+  let imageWarnings = 0;
+
+  for (const url of urls) {
+    try {
+      const product = await fetchEsselungaCatalogProduct(url);
+      const productCode = asStringValue(product.code) || esselungaProductCodeFromUrl(url);
+      const productName = decodeCatalogHtml(product.description);
+      let imageMirror: { storagePath?: string; publicUrl?: string } = {};
+      let imageError: string | undefined;
+      if (!input.skipImages) {
+        try {
+          imageMirror = await mirrorOfficialCatalogImageToStorage({
+            sourceUrl: bestEsselungaImageUrl(product),
+            sourceKey: "esselunga",
+            productCode,
+            productName,
+            referer: url,
+          });
+          if (imageMirror.publicUrl) imagesSaved += 1;
+        } catch (error) {
+          imageWarnings += 1;
+          imageError = logErrorMessage(error);
+        }
+      }
+      const ref = esselungaProductToExternalRef(url, product, imageMirror);
+      const { error } = await getSupabase()
+        .from("product_external_refs")
+        .upsert({ ...ref, source_id: sourceId }, { onConflict: "source_id,source_product_url" });
+      if (error) throw new Error(`product_external_refs_upsert_failed:${error.message}`);
+      ok += 1;
+      results.push({
+        status: "ok",
+        url,
+        code: productCode,
+        name: ref.source_name,
+        imageSaved: Boolean(imageMirror.publicUrl),
+        imageError,
+      });
+    } catch (error) {
+      failed += 1;
+      results.push({ status: "failed", url, code: esselungaProductCodeFromUrl(url), error: logErrorMessage(error) });
+    }
+  }
+
+  await getSupabase()
+    .from("retail_catalog_sources")
+    .update({
+      scrape_status: failed ? "partial" : "ready",
+      last_scraped_at: new Date().toISOString(),
+      scrape_notes: `Import Esselunga: ${ok} ok, ${failed} errori, ${imagesSaved} immagini salvate, ${imageWarnings} warning immagini.`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", sourceId);
+
+  return {
+    sourceId,
+    receivedUrls: rawUrls.length,
+    validUrls: urls.length,
+    ok,
+    failed,
+    imagesSaved,
+    imageWarnings,
+    durationMs: Math.round(performance.now() - startedAt),
+    results: results.slice(0, 40),
+  };
+};
+
+const getRetailCatalogSourceOverview = async () => {
+  const supabase = getSupabase();
+  const { data: sources, error } = await supabase
+    .from("retail_catalog_sources")
+    .select("id, merchant_key, merchant_name, enabled, scrape_status, scrape_notes, last_scraped_at, updated_at")
+    .order("merchant_name", { ascending: true });
+  if (error) throw new Error(`retail_catalog_sources_select_failed:${error.message}`);
+  return await Promise.all(
+    (sources || []).map(async (source) => {
+      const { count } = await supabase
+        .from("product_external_refs")
+        .select("*", { count: "exact", head: true })
+        .eq("source_id", source.id);
+      return {
+        id: source.id,
+        merchantKey: source.merchant_key,
+        merchantName: source.merchant_name,
+        enabled: Boolean(source.enabled),
+        scrapeStatus: source.scrape_status || "idle",
+        scrapeNotes: source.scrape_notes || "",
+        lastScrapedAt: source.last_scraped_at || null,
+        updatedAt: source.updated_at || null,
+        refsCount: count || 0,
+      };
+    }),
+  );
+};
+
 const reviewProductImageWithVision = async (input: {
   productName: string;
   product: Record<string, unknown>;
@@ -1634,6 +2264,7 @@ Regole:
 - Non rigettare solo per differenze minori di formato, numero pezzi, lingua del packaging o restyling grafico, se marca e linea prodotto sono corrette.
 - Per prodotti GDO con nome descrittivo incompleto, accetta una immagine della stessa linea/gusto quando la fonte candidato e coerente.
 - Per frutta/verdura o prodotti sfusi generici puoi accettare una foto generica del prodotto se non esiste marca specifica.
+- Se il prodotto cercato e frutta fresca semplice (es. "LAMPONI 125 G"), non accettare yogurt, kefir, dessert, confetture, succhi, barrette, torte o prodotti "al lampone": servono frutti freschi/vaschetta/confezione.
 - Rifiuta foto di ricette, scaffali, loghi, banner promozionali, ingredienti generici quando il prodotto cercato ha una marca, o prodotti simili ma di marca/gusto/formato diverso.
 - A parita di corrispondenza, abbassa molto la confidence per immagini ambientate, promozionali, con sfondo caotico o con piu prodotti non chiaramente pertinenti.
 - Se non sei sicuro, match=false.`,
@@ -1663,6 +2294,7 @@ Per scontrini devi estrarre ogni singola riga prodotto: nome esatto, quantita, p
 
 Per estratti conto devi estrarre ogni movimento in "movements".
 Se visibili, estrai anche periodo, saldo iniziale e saldo finale: "periodStart", "periodEnd", "openingBalance", "closingBalance".
+I formati tabellari CSV/Excel possono avere intestazioni molto diverse: Data operazione, Data valuta, Causale, Descrizione, Dare, Avere, Entrate, Uscite, Importo, Saldo, Divisa. Devi adattarti alla banca senza inventare righe.
 
 Per estratti carta di credito devi estrarre ogni singola spesa in "movements". Non contare il pagamento/addebito carta come prodotto. Il totale carta va in "amount" come spesa negativa se visibile, ma le righe restano in "movements".
 
@@ -1693,13 +2325,18 @@ Regole:
 - Non inventare importi o date mancanti.
 - Per ogni prodotto, "rawText" deve essere la riga originale esatta letta dallo scontrino, senza espansioni web.
 - Il campo "name" deve restare ancorato a "rawText": puoi sciogliere abbreviazioni evidenti di marca/prodotto solo se almeno marca o linea sono presenti nella riga originale.
-- Se non sei sicuro dell'espansione, usa come "name" il testo prodotto dello scontrino ripulito da IVA/prezzo e abbassa "confidence".
+- Se non sei sicuro dell'espansione, usa come "name" il testo prodotto dello scontrino ripulito da IVA/prezzo, abbassa "confidence" sotto 0.60 e aggiungi un insight "Riga da verificare".
+- Se il merchant/supermercato e visibile, usalo come contesto per capire reparto e prodotto, ma non basta da solo per cambiare identita alla riga.
+- Se uno scontrino non e GDO/supermercato o contiene servizi/negozi particolari, estrai righe generiche conservative e non forzare catalogazione prodotto: categoria "Altro" o categoria evidente, confidence bassa se incerto.
+- Se "name" e molto piu lungo o semanticamente diverso da "rawText", la confidence deve essere bassa; se non ci sono token comuni significativi, conserva "rawText" pulito come nome.
 - Non usare conoscenza web per trasformare codici o abbreviazioni ambigue in prodotti non dimostrati dalla riga originale.
 - Non includere mai totali, subtotali, IVA, pagamento carta, ricevute POS, resto, coupon, buoni, punti fedelta o righe sconto come prodotti.
 - Esempi da NON mettere in "items": "SCONTO FIDATY", "Sconto Fidaty", "Totale sconti", "Punti Fidaty", "Buono/Coupon", "Pagamento", "Resto", "IVA", "Totale", "Subtotale".
 - Se uno sconto e chiaramente collegato a un prodotto, valorizza "discountAmount" e "discountLabel" su quel prodotto; se lo sconto e generico, mettilo negli insight e non come prodotto.
 - Per scontrini supermercato, righe come "ULTIMA MAN&RIS 440G", "GOURMET", "FRSK/FRISKIES", "REVELATIONS" sono prodotti per animali domestici: non espanderle in prodotti industriali solo perche contengono codici/formati come 440G.
 - Esempio: se leggi "6BT NORDA NAT" puoi classificarlo come bevanda/acqua Norda, ma non devi cambiare brand o formato oltre quanto e plausibile dalla riga.
+- Negli estratti CSV/Excel ignora righe di intestazione, saldi, totali e note; se importo e separato in Dare/Avere, Dare/Uscite sono negative e Avere/Entrate positive.
+- Negli estratti carta distingui spese merchant, rimborsi e addebito sul conto: le spese/rimborsi vanno in movements; l'addebito carta non e una riga prodotto.
 - Per foto/PDF difficili usa confidenza bassa e warning negli insight.
 ${documentKind && documentKind !== "auto" ? `- L'utente ha indicato tipo documento probabile: ${documentKind}. Usalo come hint, ma correggilo se il documento dimostra altro.` : ""}
 ${text ? `\nTESTO DOCUMENTO:\n${text}` : ""}`;
@@ -1731,6 +2368,26 @@ Deno.serve(async (request) => {
       assertSuperAdmin(user);
       return json({
         models: await fetchStraicoModels(),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "catalog_sources") {
+      assertSuperAdmin(user);
+      return json({
+        sources: await getRetailCatalogSourceOverview(),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "catalog_import_esselunga") {
+      assertSuperAdmin(user);
+      return json({
+        importResult: await importEsselungaCatalogUrls({
+          urls: args?.urls,
+          max: args?.max,
+          skipImages: Boolean(args?.skipImages),
+        }),
         fetchedAt: new Date().toISOString(),
       });
     }
@@ -1829,7 +2486,8 @@ Regole anti-allucinazione:
 - Non trasformare abbreviazioni da scontrino in prodotti di settori diversi.
 - Se la categoria attuale e' alimentare/GDO, non proporre prodotti industriali, elettronici, ricambi, automazione o B2B.
 - Il nome originale dello scontrino resta la fonte primaria: puoi suggerire marca/formato solo se coerenti, non sostituire il prodotto.
-- Il supermercato aiuta solo a scegliere fonti italiane e packshot coerenti.
+- Il supermercato/merchant deve essere incluso nel ragionamento di ricerca immagini e reparto, ma non deve mai giustificare un prodotto non coerente con il testo originale.
+- Se il prodotto non e abbastanza certo, lascia nome/categoria originali e confidence sotto 0.65; l'utente lo correggera inline.
 - I codici peso/formato come "440G" non bastano mai per cambiare identita o settore del prodotto.
 - Esempio importante: "ULTIMA MAN&RIS 440G" da scontrino Esselunga e' una riga GDO/pet food, non "Guardmaster 440G-MZ" e non Rockwell Automation. Se non sai espandere l'abbreviazione, lascia il nome originale e confidenza bassa.
 
@@ -1891,33 +2549,50 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         });
       }
       if (allowImageSearch && !unsafe) {
+        const officialSource = officialCatalogSourceForMerchant(merchantName);
         const candidateProviders: Array<() => Promise<ProductImageCandidate[]>> = [
-          () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
-          () => fetchApifyGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
-          async () => {
-            const startedAt = performance.now();
-            const candidate = await fetchOpenFoodFactsCandidate(productName);
-            await logger({
-              step: "image_search",
-              provider: "openfoodfacts",
-              status: candidate?.imageUrl ? "success" : "success",
-              durationMs: Math.round(performance.now() - startedAt),
-              request: { productName },
-              response: {
-                selectedCandidates: candidate?.imageUrl
-                  ? [{
-                      imageUrl: candidate.imageUrl,
-                      source: candidate.imageSource,
-                      confidence: candidate.imageConfidence,
-                      name: candidate.name,
-                      brand: candidate.brand,
-                    }]
-                  : [],
-              },
-            });
-            return candidate?.imageUrl ? [candidate] : [];
-          },
+          () => fetchOfficialCatalogImageCandidates({ rawName: productName, product, merchantName, logger }),
         ];
+        if (!officialSource) {
+          candidateProviders.push(
+            () => fetchSerpApiGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
+            () => fetchApifyGoogleImageCandidates({ rawName: productName, product, merchantName, logger }),
+            async () => {
+              const startedAt = performance.now();
+              const candidate = await fetchOpenFoodFactsCandidate(productName);
+              await logger({
+                step: "image_search",
+                provider: "openfoodfacts",
+                status: candidate?.imageUrl ? "success" : "success",
+                durationMs: Math.round(performance.now() - startedAt),
+                request: { productName },
+                response: {
+                  selectedCandidates: candidate?.imageUrl
+                    ? [{
+                        imageUrl: candidate.imageUrl,
+                        source: candidate.imageSource,
+                        confidence: candidate.imageConfidence,
+                        name: candidate.name,
+                        brand: candidate.brand,
+                      }]
+                    : [],
+                },
+              });
+              return candidate?.imageUrl ? [candidate] : [];
+            },
+          );
+        } else {
+          await logger({
+            step: "image_search_policy",
+            provider: "financecompass",
+            status: "success",
+            request: { productName, merchantName, merchantKey: officialSource.key },
+            response: {
+              policy: "official_catalog_only_for_known_supermarket",
+              disabledFallbackProviders: ["serpapi_google_images_light", "apify_google_images", "openfoodfacts"],
+            },
+          });
+        }
 
         let visionReviews = 0;
         for (const getCandidates of candidateProviders) {
@@ -1926,6 +2601,24 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
           imageSearchCandidatesFound += candidates.length;
           for (const candidate of candidates) {
             if (visionReviews >= PRODUCT_IMAGE_VISION_REVIEW_LIMIT) break;
+            if (rejectIncompatibleProductImageCandidate(productName, candidate)) {
+              imageSearchStatus = "guardrail_rejected";
+              imageSearchLastRejectReason = "fresh_produce_incompatible_candidate";
+              await logger({
+                step: "image_candidate_guardrail",
+                provider: candidate.imageSource,
+                status: "rejected",
+                request: {
+                  productName,
+                  merchantName,
+                  candidateImageUrl: candidate.imageUrl,
+                  candidateSourceUrl: candidate.imageSourceUrl,
+                  candidateContext: candidate.contextText,
+                },
+                error: imageSearchLastRejectReason,
+              });
+              continue;
+            }
             const mirrorStartedAt = performance.now();
             const mirrored = await mirrorProductImageToStorage({
               sourceUrl: candidate.imageUrl,
@@ -2042,6 +2735,20 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
           if (mirroredImage?.publicUrl) {
             break;
           }
+        }
+        if (officialSource && !mirroredImage?.publicUrl && imageSearchCandidatesFound === 0) {
+          imageSearchStatus = "official_catalog_missing";
+          imageSearchLastRejectReason = "official_catalog_missing_or_not_imported";
+          await logger({
+            step: "image_search_policy",
+            provider: "financecompass",
+            status: "skipped",
+            request: { productName, merchantName, merchantKey: officialSource.key },
+            response: {
+              reason: imageSearchLastRejectReason,
+              fallbackProvidersSkipped: true,
+            },
+          });
         }
       }
 
