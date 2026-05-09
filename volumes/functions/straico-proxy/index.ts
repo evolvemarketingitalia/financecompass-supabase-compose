@@ -254,7 +254,13 @@ const sanitizeLogValue = (value: unknown, depth = 0): unknown => {
   return String(value);
 };
 
-const logErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error || "Errore sconosciuto"));
+const logErrorMessage = (error: unknown) => {
+  if (error instanceof Error) return error.message;
+  const record = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
+  if (typeof record?.message === "string") return record.message;
+  if (typeof record?.error === "string") return record.error;
+  return String(error || "Errore sconosciuto");
+};
 
 const isMissingSchemaColumnError = (error: unknown, column: string) => {
   const message = logErrorMessage(error).toLowerCase();
