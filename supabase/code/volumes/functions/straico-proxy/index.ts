@@ -3301,6 +3301,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               mirroredImage = mirrored;
               imageVisionReview = finalReview;
               imageSearchStatus = "accepted";
+              imageSearchLastRejectReason = null;
               await upsertReceiptMatchIndex({
                 householdId,
                 userId: user.id,
@@ -3361,6 +3362,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         product.imageSearchStatus = imageSearchStatus;
         product.imageSearchCandidatesFound = imageSearchCandidatesFound;
         product.imageSearchCandidatesReviewed = imageSearchCandidatesReviewed;
+        product.imageSearchLastRejectReason = null;
         product.enrichmentSource = `straico+${imageCandidate.imageSource}+storage`;
         product.merchantCategories = Array.from(
           new Set([
@@ -3396,7 +3398,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
         imageSearchStatus,
         candidatesFound: imageSearchCandidatesFound,
         candidatesReviewed: imageSearchCandidatesReviewed,
-        lastRejectReason: imageSearchLastRejectReason || asStringValue(product.imageVisionReason) || null,
+        lastRejectReason: imageSaved ? null : imageSearchLastRejectReason || asStringValue(product.imageVisionReason) || null,
         durationMs: Math.round(performance.now() - runStartedAt),
         output: {
           product,
@@ -3404,7 +3406,7 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
           imageSearchStatus,
           imageSearchCandidatesFound,
           imageSearchCandidatesReviewed,
-          imageSearchLastRejectReason,
+          imageSearchLastRejectReason: imageSaved ? null : imageSearchLastRejectReason,
         },
       });
 
