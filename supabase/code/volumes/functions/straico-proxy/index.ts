@@ -558,22 +558,143 @@ const getModelSettings = async (): Promise<StraicoModelSettings> => {
   return { ...DEFAULT_MODELS, ...((data?.value_json as Partial<StraicoModelSettings> | null) || {}) };
 };
 
-const postStraico = async (path: string, body: unknown) => {
-  const response = await fetch(`${STRAICO_BASE_URL}${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${requireEnv("STRAICO_API_KEY")}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+type StraicoUsageContext = {
+  activity: string;
+  userId?: string;
+  userEmail?: string;
+  householdId?: string | null;
+  productEnrichmentRunId?: string | null;
+  model?: string;
+};
+
+const localRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+
+const wordCount = (value: string) => value.trim().split(/\s+/).filter(Boolean).length;
+
+const textFromStraicoPayload = (payload: unknown, model?: string) => {
+  const data = localRecord(localRecord(payload).data);
+  const direct = localRecord(data.completion);
+  const directText = String(localRecord(localRecord((direct.choices as unknown[])?.[0]).message).content || "");
+  if (directText) return directText;
+  const completions = localRecord(data.completions);
+  const selectedCompletion = model ? localRecord(completions[model]) : localRecord(Object.values(completions)[0]);
+  return String(localRecord(localRecord((localRecord(selectedCompletion.completion).choices as unknown[])?.[0]).message).content || "");
+};
+
+const findStraicoCredits = (value: unknown, depth = 0): number | undefined => {
+  if (depth > 5 || value === null || value === undefined) return undefined;
+  if (typeof value !== "object") return undefined;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedKey = key.toLowerCase();
+    const isCreditKey =
+      /(coins?_used|credits?_used|total_coins?|total_credits?|overall_coins?|overall_credits?|coins?_spent|credits?_spent)/.test(normalizedKey);
+    const number = Number(item);
+    if (isCreditKey && Number.isFinite(number)) return number;
+    const nested = findStraicoCredits(item, depth + 1);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+};
+
+const logStraicoUsage = async (input: {
+  path: string;
+  body: unknown;
+  context?: StraicoUsageContext;
+  status: "success" | "failed";
+  durationMs: number;
+  responsePayload?: unknown;
+  errorMessage?: string;
+}) => {
+  if (!input.context?.activity) return;
+  const body = localRecord(input.body);
+  const model = input.context.model || String(body.model || (Array.isArray(body.models) ? body.models[0] : "") || body.smart_llm_selector || "");
+  const message = String(body.message || "");
+  const output = input.responsePayload ? textFromStraicoPayload(input.responsePayload, model) : "";
+  const actualCredits = input.responsePayload ? findStraicoCredits(input.responsePayload) : undefined;
+  try {
+    const { error } = await getSupabase().from("straico_usage_events").insert({
+      user_id: input.context.userId,
+      user_email: input.context.userEmail,
+      household_id: input.context.householdId || null,
+      product_enrichment_run_id: input.context.productEnrichmentRunId || null,
+      activity: input.context.activity,
+      endpoint: input.path,
+      model,
+      status: input.status,
+      input_chars: message.length,
+      output_chars: output.length,
+      input_words: wordCount(message),
+      output_words: wordCount(output),
+      actual_total_credits: actualCredits,
+      duration_ms: input.durationMs,
+      request_json: sanitizeLogValue({
+        model,
+        endpoint: input.path,
+        smart: body.smart_llm_selector,
+        inputChars: message.length,
+        images: Array.isArray(body.images) ? body.images.length : 0,
+        fileUrls: Array.isArray(body.file_urls) ? body.file_urls.length : 0,
+      }),
+      response_json: sanitizeLogValue({
+        outputChars: output.length,
+        actualCredits,
+      }),
+      error_message: input.errorMessage,
+    });
+    if (error) console.error("straico_usage_insert_failed", error.message);
+  } catch (error) {
+    console.error("straico_usage_insert_failed", logErrorMessage(error));
+  }
+};
+
+const postStraico = async (path: string, body: unknown, context?: StraicoUsageContext) => {
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetch(`${STRAICO_BASE_URL}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${requireEnv("STRAICO_API_KEY")}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    await logStraicoUsage({
+      path,
+      body,
+      context,
+      status: "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      errorMessage: logErrorMessage(error),
+    });
+    throw error;
+  }
 
   if (!response.ok) {
     const payload = await response.text().catch(() => "");
+    await logStraicoUsage({
+      path,
+      body,
+      context,
+      status: "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      errorMessage: payload || `Straico error ${response.status}`,
+    });
     throw new Error(payload || `Straico error ${response.status}`);
   }
 
-  return response.json() as Promise<StraicoCompletionPayload>;
+  const payload = await response.json() as StraicoCompletionPayload;
+  await logStraicoUsage({
+    path,
+    body,
+    context,
+    status: "success",
+    durationMs: Math.round(performance.now() - startedAt),
+    responsePayload: payload,
+  });
+  return payload;
 };
 
 const asRecord = (value: unknown): Record<string, unknown> =>
@@ -895,15 +1016,23 @@ const fetchStraicoModels = async () => {
   }
 };
 
-const completionV0 = async (message: string, options: { model?: string; smart?: "quality" | "balance" | "budget" }) => {
+const completionV0 = async (
+  message: string,
+  options: { model?: string; smart?: "quality" | "balance" | "budget" },
+  usage?: StraicoUsageContext,
+) => {
   const body = options.smart
     ? { smart_llm_selector: options.smart, message, temperature: 0.35, max_tokens: 2200, replace_failed_models: true }
     : { model: options.model || DEFAULT_MODELS.chat, message, temperature: 0.35, max_tokens: 2200, replace_failed_models: true };
-  const data = await postStraico("/v0/prompt/completion", body);
+  const data = await postStraico("/v0/prompt/completion", body, { ...usage, model: options.model || usage?.model || DEFAULT_MODELS.chat });
   return String(data?.data?.completion?.choices?.[0]?.message?.content || "");
 };
 
-const completionV1 = async (message: string, input: { model?: string; images?: string[]; fileUrls?: string[] }) => {
+const completionV1 = async (
+  message: string,
+  input: { model?: string; images?: string[]; fileUrls?: string[] },
+  usage?: StraicoUsageContext,
+) => {
   const model = input.model || DEFAULT_MODELS.documentAnalysis;
   const data = await postStraico("/v1/prompt/completion", {
     models: [model],
@@ -913,7 +1042,7 @@ const completionV1 = async (message: string, input: { model?: string; images?: s
     temperature: 0.2,
     max_tokens: 3000,
     replace_failed_models: true,
-  });
+  }, { ...usage, model });
   return String(data?.data?.completions?.[model]?.completion?.choices?.[0]?.message?.content || "");
 };
 
@@ -963,6 +1092,7 @@ const fetchOpenFoodFactsCandidate = async (productName: string) => {
 };
 
 type ProductImageCandidate = {
+  externalRefId?: string;
   name?: string;
   brand?: string;
   weight?: string;
@@ -1088,6 +1218,45 @@ const officialDomainsForMerchant = (merchantName?: string) => {
   return source?.domains || [];
 };
 
+const upsertReceiptMatchIndex = async (input: {
+  householdId?: string | null;
+  userId?: string;
+  rawName: string;
+  merchantName?: string;
+  canonicalName: string;
+  brand?: string;
+  category?: string;
+  productId?: string;
+  externalRefId?: string;
+  confidence: number;
+  matchSource: string;
+}) => {
+  const source = officialCatalogSourceForMerchant(input.merchantName);
+  if (!source || !input.householdId || !input.rawName.trim() || !input.canonicalName.trim()) return;
+  try {
+    const { error } = await getSupabase().from("product_receipt_match_index").upsert({
+      household_id: input.householdId,
+      merchant_key: source.key,
+      merchant_name: input.merchantName,
+      raw_name: input.rawName,
+      raw_normalized_name: normalizeSearchTerm(input.rawName),
+      canonical_name: input.canonicalName,
+      brand: input.brand || null,
+      category: input.category || null,
+      product_id: input.productId || null,
+      external_ref_id: input.externalRefId || null,
+      confidence: Math.max(0, Math.min(1, input.confidence)),
+      match_source: input.matchSource,
+      match_count: 1,
+      last_matched_at: new Date().toISOString(),
+      updated_by: input.userId || null,
+    }, { onConflict: "household_id,merchant_key,raw_normalized_name" });
+    if (error) console.error("receipt_match_index_upsert_failed", error.message);
+  } catch (error) {
+    console.error("receipt_match_index_upsert_failed", logErrorMessage(error));
+  }
+};
+
 const isOfficialMerchantCatalogUrl = (value: string, merchantName?: string) => {
   const normalizedValue = normalizeSearchTerm(value);
   return officialDomainsForMerchant(merchantName).some((domain) => normalizedValue.includes(normalizeSearchTerm(domain)));
@@ -1157,6 +1326,10 @@ const catalogTokenStopwords = new Set([
 const expandCatalogAbbreviations = (value: string, merchantKey?: string) => {
   let next = ` ${normalizeSearchTerm(value)} `;
   next = next
+    .replace(/\bc\s+cola\b/g, " coca cola ")
+    .replace(/\blat\b/g, " lattina ")
+    .replace(/\blatt\b/g, " lattina ")
+    .replace(/\b(\d{2,4})x(\d{1,3})\b/g, " $1 $2 ")
     .replace(/\bsg\b/g, " sgusciate ")
     .replace(/\bnat\b/g, " naturale ")
     .replace(/\bfriz\b/g, " frizzante ")
@@ -1170,6 +1343,29 @@ const catalogTokens = (value: string, merchantKey?: string) =>
   expandCatalogAbbreviations(value, merchantKey)
     .split(" ")
     .filter((token) => token.length >= 2 && !catalogTokenStopwords.has(token) && !/^\d+$/.test(token));
+
+const officialCatalogSearchPhrases = (rawName: string, product: Record<string, unknown>, merchantKey?: string) => {
+  const aliases = Array.isArray(product.aliases) ? product.aliases.map(asStringValue) : [];
+  const brand = asStringValue(product.brand);
+  const productName = asStringValue(product.name);
+  const phrases = [
+    rawName,
+    productName,
+    ...aliases,
+    brand ? `${brand} ${rawName}` : "",
+    brand && productName ? `${brand} ${productName}` : "",
+  ]
+    .map(safeSearchName)
+    .filter((value) => value.length >= 3);
+  return Array.from(new Set(phrases.map((value) => expandCatalogAbbreviations(value, merchantKey)).filter(Boolean))).slice(0, 12);
+};
+
+const officialCatalogSearchTokens = (rawName: string, product: Record<string, unknown>, merchantKey?: string) => {
+  const tokens = officialCatalogSearchPhrases(rawName, product, merchantKey)
+    .flatMap((phrase) => catalogTokens(phrase, merchantKey))
+    .filter((token) => token !== merchantKey && token.length >= 3);
+  return Array.from(new Set(tokens)).slice(0, 8);
+};
 
 const scoreOfficialCatalogRef = (productName: string, ref: Record<string, unknown>, merchantKey?: string) => {
   const inputTokens = catalogTokens(productName, merchantKey)
@@ -1245,7 +1441,8 @@ const fetchOfficialCatalogImageCandidates = async (input: {
       return [];
     }
 
-    const tokens = Array.from(new Set(catalogTokens(input.rawName, source.key).filter((token) => token.length >= 3))).slice(0, 4);
+    const searchPhrases = officialCatalogSearchPhrases(input.rawName, input.product, source.key);
+    const tokens = officialCatalogSearchTokens(input.rawName, input.product, source.key);
     const rowsById = new Map<string, Record<string, unknown>>();
     const selectColumns = [
       "id",
@@ -1272,7 +1469,7 @@ const fetchOfficialCatalogImageCandidates = async (input: {
           .from("product_external_refs")
           .select(availableSelectColumns.join(","))
           .eq("source_id", catalogSource.id)
-          .ilike("source_normalized_name", `%${token}%`)
+          .or(`source_normalized_name.ilike.%${token}%,source_name.ilike.%${token}%,source_brand.ilike.%${token}%`)
           .limit(60);
         data = (result.data || null) as Record<string, unknown>[] | null;
         error = result.error;
@@ -1298,11 +1495,15 @@ const fetchOfficialCatalogImageCandidates = async (input: {
     }
 
     const candidates = Array.from(rowsById.values())
-      .map((row) => ({ row, score: scoreOfficialCatalogRef(input.rawName, row, source.key) }))
+      .map((row) => ({
+        row,
+        score: Math.max(...searchPhrases.map((phrase) => scoreOfficialCatalogRef(phrase, row, source.key)), 0),
+      }))
       .filter(({ row, score }) => score >= 0.46 && (asStringValue(row.source_image_public_url) || asStringValue(row.source_image_url)))
       .sort((a, b) => b.score - a.score)
       .slice(0, 6)
       .map(({ row, score }) => ({
+        externalRefId: asStringValue(row.id) || undefined,
         name: asStringValue(row.source_name) || safeSearchName(input.rawName),
         brand: asStringValue(row.source_brand) || asStringValue(input.product.brand) || undefined,
         weight: asStringValue(row.source_weight) || asStringValue(input.product.weight) || undefined,
@@ -1330,7 +1531,7 @@ const fetchOfficialCatalogImageCandidates = async (input: {
       provider: "official_catalog",
       status: "success",
       durationMs: Math.round(performance.now() - startedAt),
-      request: { merchantKey: source.key, productName: input.rawName, tokens },
+      request: { merchantKey: source.key, productName: input.rawName, searchPhrases, tokens },
       response: {
         rawResults: rowsById.size,
         selectedCandidates: candidates.map((candidate) => ({
@@ -1441,7 +1642,7 @@ const scoreProductImageCandidate = (item: Record<string, unknown>, productName: 
 
 const productImageTokenMatches = (productName: string, candidate: ProductImageCandidate) => {
   const haystack = productImageCandidateContext(candidate);
-  const tokens = normalizeSearchTerm(productName)
+  const tokens = expandCatalogAbbreviations(productName)
     .split(" ")
     .filter((token) => token.length >= 3 && !["con", "per", "del", "dell", "della", "prodotto", "mousse"].includes(token));
   return tokens.filter((token) => haystack.includes(token)).length;
@@ -2564,6 +2765,7 @@ const reviewProductImageWithVision = async (input: {
   product: Record<string, unknown>;
   imageUrl: string;
   model: string;
+  usage?: StraicoUsageContext;
 }): Promise<ProductImageVisionReview> => {
   try {
     const content = await completionV1(
@@ -2594,6 +2796,7 @@ Regole:
 - A parita di corrispondenza, abbassa molto la confidence per immagini ambientate, promozionali, con sfondo caotico o con piu prodotti non chiaramente pertinenti.
 - Se non sei sicuro, match=false.`,
       { model: input.model, images: [input.imageUrl] },
+      input.usage,
     );
     const review = extractJson<Record<string, unknown>>(content, {});
     const confidence = Math.max(0, Math.min(1, asOptionalNumber(review.confidence) ?? 0));
@@ -2760,14 +2963,22 @@ Deno.serve(async (request) => {
       const images = args?.images as string[] | undefined;
       const text = args?.text as string | undefined;
       const documentKind = args?.documentKind ? String(args.documentKind) : undefined;
+      const householdId = await getUserHouseholdId(user.id);
+      const usage = {
+        activity: "document_analysis",
+        userId: user.id,
+        userEmail: user.email,
+        householdId,
+        model: images?.length || args?.fileUrls?.length ? models.documentAnalysis : models.chat,
+      };
       const content =
         images?.length || args?.fileUrls?.length
           ? await completionV1(receiptPrompt(text, documentKind), {
               images,
               fileUrls: args?.fileUrls,
               model: models.documentAnalysis,
-            })
-          : await completionV0(receiptPrompt(text, documentKind), { model: models.chat });
+            }, usage)
+          : await completionV0(receiptPrompt(text, documentKind), { model: models.chat }, usage);
       return json({ analysis: extractJson(content, { summary: content || "Documento analizzato" }) });
     }
 
@@ -2851,7 +3062,14 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
       let content = "";
       const metadataStartedAt = performance.now();
       try {
-        content = await completionV0(productResearchPrompt, { model: models.productResearch });
+        content = await completionV0(productResearchPrompt, { model: models.productResearch }, {
+          activity: "product_metadata_research",
+          userId: user.id,
+          userEmail: user.email,
+          householdId,
+          productEnrichmentRunId: runId,
+          model: models.productResearch,
+        });
       } catch (error) {
         await logger({
           step: "product_metadata_research",
@@ -3023,6 +3241,14 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               product,
               imageUrl: candidate.imageUrl,
               model: models.documentAnalysis,
+              usage: {
+                activity: "product_image_vision_review",
+                userId: user.id,
+                userEmail: user.email,
+                householdId,
+                productEnrichmentRunId: runId,
+                model: models.documentAnalysis,
+              },
             });
             const fallbackAccepted =
               !review.accepted &&
@@ -3075,6 +3301,19 @@ Prodotto: "${productName}"${currentCategory ? `, categoria attuale: "${currentCa
               mirroredImage = mirrored;
               imageVisionReview = finalReview;
               imageSearchStatus = "accepted";
+              await upsertReceiptMatchIndex({
+                householdId,
+                userId: user.id,
+                rawName: productName,
+                merchantName,
+                canonicalName: candidate.name || asStringValue(product.name) || productName,
+                brand: candidate.brand || asStringValue(product.brand) || undefined,
+                category: asStringValue(product.category) || currentCategory,
+                productId,
+                externalRefId: candidate.externalRefId,
+                confidence: Math.max(candidate.imageConfidence, finalReview.confidence),
+                matchSource: candidate.imageSource?.startsWith("official_catalog") ? "official_catalog_image_enrichment" : "image_enrichment",
+              });
               break;
             }
             imageSearchStatus = "vision_rejected";
@@ -3189,6 +3428,13 @@ ${args?.financialContext || ""}
 DOMANDA:
 ${args?.question || ""}`,
         { model: models.ragChat || models.chat },
+        {
+          activity: "rag_chat",
+          userId: user.id,
+          userEmail: user.email,
+          householdId: await getUserHouseholdId(user.id),
+          model: models.ragChat || models.chat,
+        },
       );
       return json({ answer });
     }
