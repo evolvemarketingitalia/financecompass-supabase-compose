@@ -2178,6 +2178,75 @@ const esselungaProductToExternalRef = (
   };
 };
 
+type EsselungaCatalogImportItemResult = {
+  status: "ok" | "failed";
+  url: string;
+  code?: string;
+  name?: string;
+  imageSaved?: boolean;
+  imageError?: string;
+  error?: string;
+};
+
+const upsertProductExternalRefWithSchemaFallback = async (payload: Record<string, unknown>) => {
+  const supabase = getSupabase();
+  const upsertPayload: Record<string, unknown> = { ...payload };
+  let error: { message?: string } | null = null;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const result = await supabase.from("product_external_refs").upsert(upsertPayload, { onConflict: "source_id,source_product_url" });
+    error = result.error;
+    const missingColumn = missingSchemaColumnName(error);
+    if (error && missingColumn && Object.prototype.hasOwnProperty.call(upsertPayload, missingColumn)) {
+      delete upsertPayload[missingColumn];
+      continue;
+    }
+    break;
+  }
+  if (error) throw new Error(`product_external_refs_upsert_failed:${error.message}`);
+};
+
+const importOneEsselungaCatalogUrl = async (sourceId: string, url: string, skipImages: boolean) => {
+  const product = await fetchEsselungaCatalogProduct(url);
+  const productCode = asStringValue(product.code) || esselungaProductCodeFromUrl(url);
+  const productName = decodeCatalogHtml(product.description);
+  let imageMirror: { storagePath?: string; publicUrl?: string } = {};
+  let imageError: string | undefined;
+  let imagesSaved = 0;
+  let imageWarnings = 0;
+
+  if (!skipImages) {
+    try {
+      imageMirror = await mirrorOfficialCatalogImageToStorage({
+        sourceUrl: bestEsselungaImageUrl(product),
+        sourceKey: "esselunga",
+        productCode,
+        productName,
+        referer: url,
+      });
+      if (imageMirror.publicUrl) imagesSaved += 1;
+    } catch (error) {
+      imageWarnings += 1;
+      imageError = logErrorMessage(error);
+    }
+  }
+
+  const ref = esselungaProductToExternalRef(url, product, imageMirror);
+  await upsertProductExternalRefWithSchemaFallback({ ...ref, source_id: sourceId });
+
+  return {
+    imagesSaved,
+    imageWarnings,
+    result: {
+      status: "ok" as const,
+      url,
+      code: productCode,
+      name: ref.source_name,
+      imageSaved: Boolean(imageMirror.publicUrl),
+      imageError,
+    },
+  };
+};
+
 const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: boolean; max?: unknown }) => {
   const rawUrls = Array.isArray(input.urls) ? input.urls : [];
   const urls = Array.from(new Set(rawUrls.map(asStringValue).filter(isEsselungaProductUrl))).slice(
@@ -2186,15 +2255,7 @@ const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: 
   );
   const startedAt = performance.now();
   const sourceId = await ensureEsselungaCatalogSource();
-  const results: Array<{
-    status: "ok" | "failed";
-    url: string;
-    code?: string;
-    name?: string;
-    imageSaved?: boolean;
-    imageError?: string;
-    error?: string;
-  }> = [];
+  const results: EsselungaCatalogImportItemResult[] = [];
   let ok = 0;
   let failed = 0;
   let imagesSaved = 0;
@@ -2202,53 +2263,11 @@ const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: 
 
   for (const url of urls) {
     try {
-      const product = await fetchEsselungaCatalogProduct(url);
-      const productCode = asStringValue(product.code) || esselungaProductCodeFromUrl(url);
-      const productName = decodeCatalogHtml(product.description);
-      let imageMirror: { storagePath?: string; publicUrl?: string } = {};
-      let imageError: string | undefined;
-      if (!input.skipImages) {
-        try {
-          imageMirror = await mirrorOfficialCatalogImageToStorage({
-            sourceUrl: bestEsselungaImageUrl(product),
-            sourceKey: "esselunga",
-            productCode,
-            productName,
-            referer: url,
-          });
-          if (imageMirror.publicUrl) imagesSaved += 1;
-        } catch (error) {
-          imageWarnings += 1;
-          imageError = logErrorMessage(error);
-        }
-      }
-      const ref = esselungaProductToExternalRef(url, product, imageMirror);
-      const payload = { ...ref, source_id: sourceId };
-      const supabase = getSupabase();
-      const upsertPayload: Record<string, unknown> = { ...payload };
-      let error: { message?: string } | null = null;
-      for (let attempt = 0; attempt < 16; attempt += 1) {
-        const result = await supabase
-          .from("product_external_refs")
-          .upsert(upsertPayload, { onConflict: "source_id,source_product_url" });
-        error = result.error;
-        const missingColumn = missingSchemaColumnName(error);
-        if (error && missingColumn && Object.prototype.hasOwnProperty.call(upsertPayload, missingColumn)) {
-          delete upsertPayload[missingColumn];
-          continue;
-        }
-        break;
-      }
-      if (error) throw new Error(`product_external_refs_upsert_failed:${error.message}`);
+      const imported = await importOneEsselungaCatalogUrl(sourceId, url, Boolean(input.skipImages));
       ok += 1;
-      results.push({
-        status: "ok",
-        url,
-        code: productCode,
-        name: ref.source_name,
-        imageSaved: Boolean(imageMirror.publicUrl),
-        imageError,
-      });
+      imagesSaved += imported.imagesSaved;
+      imageWarnings += imported.imageWarnings;
+      results.push(imported.result);
     } catch (error) {
       failed += 1;
       results.push({ status: "failed", url, code: esselungaProductCodeFromUrl(url), error: logErrorMessage(error) });
@@ -2276,6 +2295,240 @@ const importEsselungaCatalogUrls = async (input: { urls?: unknown; skipImages?: 
     durationMs: Math.round(performance.now() - startedAt),
     results: results.slice(0, 40),
   };
+};
+
+const mapCatalogImportJobItemResult = (item: Record<string, unknown>): EsselungaCatalogImportItemResult => ({
+  status: item.status === "ok" ? "ok" : "failed",
+  url: String(item.url || ""),
+  code: item.code ? String(item.code) : undefined,
+  name: item.product_name ? String(item.product_name) : undefined,
+  imageSaved: Boolean(item.image_saved),
+  imageError: item.image_error ? String(item.image_error) : undefined,
+  error: item.error_message ? String(item.error_message) : undefined,
+});
+
+const getCatalogImportJobStatus = async (jobId?: string) => {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("retail_catalog_import_jobs")
+    .select("*")
+    .eq("merchant_key", "esselunga")
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (jobId) query = supabase.from("retail_catalog_import_jobs").select("*").eq("id", jobId).limit(1);
+
+  const { data: jobs, error } = await query;
+  if (error) throw new Error(`retail_catalog_import_jobs_select_failed:${error.message}`);
+  const job = jobs?.[0] as Record<string, unknown> | undefined;
+  if (!job) return null;
+
+  const { data: items } = await supabase
+    .from("retail_catalog_import_job_items")
+    .select("status, url, code, product_name, image_saved, image_error, error_message, processed_at, position")
+    .eq("job_id", job.id)
+    .neq("status", "queued")
+    .order("position", { ascending: false })
+    .limit(40);
+
+  return {
+    id: String(job.id),
+    sourceId: String(job.source_id || ""),
+    merchantKey: String(job.merchant_key || "esselunga"),
+    status: String(job.status || "queued"),
+    totalUrls: Number(job.total_urls || 0),
+    processedUrls: Number(job.processed_urls || 0),
+    ok: Number(job.ok_count || 0),
+    failed: Number(job.failed_count || 0),
+    imagesSaved: Number(job.images_saved || 0),
+    imageWarnings: Number(job.image_warnings || 0),
+    chunkSize: Number(job.chunk_size || 60),
+    skipImages: Boolean(job.skip_images),
+    errorMessage: job.error_message ? String(job.error_message) : undefined,
+    createdAt: job.created_at || null,
+    startedAt: job.started_at || null,
+    finishedAt: job.finished_at || null,
+    updatedAt: job.updated_at || null,
+    results: (items || []).map((item) => mapCatalogImportJobItemResult(asRecord(item))).reverse(),
+  };
+};
+
+const createEsselungaCatalogImportJob = async (
+  input: { urls?: unknown; skipImages?: boolean; chunkSize?: unknown },
+  userId?: string,
+) => {
+  const rawUrls = Array.isArray(input.urls) ? input.urls : [];
+  const urls = Array.from(new Set(rawUrls.map(asStringValue).filter(isEsselungaProductUrl))).slice(0, 50000);
+  if (!urls.length) throw new Error("Nessun URL prodotto Esselunga valido");
+
+  const sourceId = await ensureEsselungaCatalogSource();
+  const chunkSize = Math.max(1, Math.min(Number(input.chunkSize) || 60, 120));
+  const supabase = getSupabase();
+  const { data: job, error } = await supabase
+    .from("retail_catalog_import_jobs")
+    .insert({
+      source_id: sourceId,
+      merchant_key: "esselunga",
+      status: "queued",
+      total_urls: urls.length,
+      chunk_size: chunkSize,
+      skip_images: Boolean(input.skipImages),
+      started_by_user_id: userId || null,
+    })
+    .select("id")
+    .single();
+  if (error) throw new Error(`retail_catalog_import_jobs_insert_failed:${error.message}`);
+
+  const rows = urls.map((url, index) => ({
+    job_id: job.id,
+    url,
+    position: index,
+    status: "queued",
+    code: esselungaProductCodeFromUrl(url),
+  }));
+  for (let cursor = 0; cursor < rows.length; cursor += 1000) {
+    const { error: itemsError } = await supabase.from("retail_catalog_import_job_items").insert(rows.slice(cursor, cursor + 1000));
+    if (itemsError) throw new Error(`retail_catalog_import_job_items_insert_failed:${itemsError.message}`);
+  }
+
+  await supabase
+    .from("retail_catalog_sources")
+    .update({
+      scrape_status: "queued",
+      scrape_notes: `Job Esselunga creato: 0/${urls.length} URL processati.`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", sourceId);
+
+  return await getCatalogImportJobStatus(String(job.id));
+};
+
+const processEsselungaCatalogImportJob = async (jobId: string, limit?: unknown) => {
+  const supabase = getSupabase();
+  const { data: job, error } = await supabase
+    .from("retail_catalog_import_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (error) throw new Error(`retail_catalog_import_jobs_select_failed:${error.message}`);
+  if (!job) throw new Error("Job import catalogo non trovato");
+  if (["completed", "failed", "canceled"].includes(String(job.status))) return await getCatalogImportJobStatus(jobId);
+
+  const sourceId = String(job.source_id || "");
+  const chunkSize = Math.max(1, Math.min(Number(limit) || Number(job.chunk_size) || 60, 120));
+  const { data: items, error: itemsError } = await supabase
+    .from("retail_catalog_import_job_items")
+    .select("id, url, position")
+    .eq("job_id", jobId)
+    .in("status", ["queued", "processing"])
+    .order("position", { ascending: true })
+    .limit(chunkSize);
+  if (itemsError) throw new Error(`retail_catalog_import_job_items_select_failed:${itemsError.message}`);
+
+  if (!items?.length) {
+    await supabase
+      .from("retail_catalog_import_jobs")
+      .update({ status: "completed", finished_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("id", jobId);
+    await supabase
+      .from("retail_catalog_sources")
+      .update({
+        scrape_status: Number(job.failed_count || 0) ? "partial" : "ready",
+        last_scraped_at: new Date().toISOString(),
+        scrape_notes: `Job Esselunga concluso: ${Number(job.ok_count || 0)} ok, ${Number(job.failed_count || 0)} errori, ${Number(job.images_saved || 0)} immagini salvate.`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", sourceId);
+    return await getCatalogImportJobStatus(jobId);
+  }
+
+  const itemIds = items.map((item) => item.id);
+  await supabase
+    .from("retail_catalog_import_jobs")
+    .update({
+      status: "running",
+      started_at: job.started_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId);
+  await supabase.from("retail_catalog_import_job_items").update({ status: "processing" }).in("id", itemIds);
+
+  let ok = 0;
+  let failed = 0;
+  let imagesSaved = 0;
+  let imageWarnings = 0;
+  const results: EsselungaCatalogImportItemResult[] = [];
+
+  for (const item of items) {
+    const url = String(item.url || "");
+    try {
+      const imported = await importOneEsselungaCatalogUrl(sourceId, url, Boolean(job.skip_images));
+      ok += 1;
+      imagesSaved += imported.imagesSaved;
+      imageWarnings += imported.imageWarnings;
+      results.push(imported.result);
+      await supabase
+        .from("retail_catalog_import_job_items")
+        .update({
+          status: "ok",
+          code: imported.result.code || esselungaProductCodeFromUrl(url),
+          product_name: imported.result.name || null,
+          image_saved: Boolean(imported.result.imageSaved),
+          image_error: imported.result.imageError || null,
+          error_message: null,
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", item.id);
+    } catch (error) {
+      failed += 1;
+      const message = logErrorMessage(error);
+      const failedResult = { status: "failed" as const, url, code: esselungaProductCodeFromUrl(url), error: message };
+      results.push(failedResult);
+      await supabase
+        .from("retail_catalog_import_job_items")
+        .update({
+          status: "failed",
+          code: failedResult.code,
+          error_message: message,
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", item.id);
+    }
+  }
+
+  const processedUrls = Number(job.processed_urls || 0) + items.length;
+  const totalUrls = Number(job.total_urls || 0);
+  const isCompleted = processedUrls >= totalUrls;
+  const nextOk = Number(job.ok_count || 0) + ok;
+  const nextFailed = Number(job.failed_count || 0) + failed;
+  const nextImagesSaved = Number(job.images_saved || 0) + imagesSaved;
+  const nextImageWarnings = Number(job.image_warnings || 0) + imageWarnings;
+
+  await supabase
+    .from("retail_catalog_import_jobs")
+    .update({
+      status: isCompleted ? "completed" : "running",
+      processed_urls: processedUrls,
+      ok_count: nextOk,
+      failed_count: nextFailed,
+      images_saved: nextImagesSaved,
+      image_warnings: nextImageWarnings,
+      finished_at: isCompleted ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId);
+
+  await supabase
+    .from("retail_catalog_sources")
+    .update({
+      scrape_status: isCompleted ? (nextFailed ? "partial" : "ready") : "running",
+      last_scraped_at: isCompleted ? new Date().toISOString() : job.last_scraped_at,
+      scrape_notes: `Job Esselunga: ${processedUrls}/${totalUrls} URL, ${nextOk} ok, ${nextFailed} errori, ${nextImagesSaved} immagini salvate.`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", sourceId);
+
+  const status = await getCatalogImportJobStatus(jobId);
+  return status ? { ...status, results: [...(status.results || []), ...results].slice(-40) } : status;
 };
 
 const getRetailCatalogSourceOverview = async () => {
@@ -2460,6 +2713,37 @@ Deno.serve(async (request) => {
           max: args?.max,
           skipImages: Boolean(args?.skipImages),
         }),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "catalog_import_esselunga_job_create") {
+      assertSuperAdmin(user);
+      return json({
+        job: await createEsselungaCatalogImportJob(
+          {
+            urls: args?.urls,
+            skipImages: Boolean(args?.skipImages),
+            chunkSize: args?.chunkSize,
+          },
+          user.id,
+        ),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "catalog_import_job_status") {
+      assertSuperAdmin(user);
+      return json({
+        job: await getCatalogImportJobStatus(args?.jobId ? String(args.jobId) : undefined),
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    if (action === "catalog_import_job_process") {
+      assertSuperAdmin(user);
+      return json({
+        job: await processEsselungaCatalogImportJob(String(args?.jobId || ""), args?.limit),
         fetchedAt: new Date().toISOString(),
       });
     }
